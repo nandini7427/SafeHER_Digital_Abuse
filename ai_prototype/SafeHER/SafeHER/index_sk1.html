@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>GuardianAI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+body {
+  background: radial-gradient(circle at top, #0f172a, #020617);
+  color: white;
+}
+.glass {
+  background: rgba(255,255,255,0.05);
+  backdrop-filter: blur(12px);
+  border-radius: 20px;
+  padding: 20px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="max-w-6xl mx-auto p-6">
+
+<h1 class="text-center text-4xl font-bold mb-8 text-green-400">
+ GuardianAI Advanced
+</h1>
+
+<div class="grid md:grid-cols-2 gap-8">
+
+<!-- IMAGE -->
+<div class="glass">
+<h2>Upload Image</h2>
+
+<input type="file" id="imageInput" class="mb-3">
+
+<img id="preview" class="hidden rounded mb-3" width="100%">
+
+<button onclick="checkImage()" class="bg-blue-500 px-4 py-2 rounded">
+Scan Image
+</button>
+
+<div id="imgResult" class="mt-4"></div>
+</div>
+
+<!-- TEXT -->
+<div class="glass">
+<h2>Text Analysis</h2>
+
+<textarea id="textInput" class="w-full p-3 bg-black mb-3"></textarea>
+
+<button onclick="checkText()" class="bg-green-500 px-4 py-2 rounded">
+Analyze
+</button>
+
+<div id="textResult" class="mt-4"></div>
+</div>
+
+</div>
+
+</div>
+
+<script>
+
+// IMAGE PREVIEW
+document.getElementById("imageInput").addEventListener("change", e => {
+  let file = e.target.files[0];
+  let preview = document.getElementById("preview");
+
+  preview.src = URL.createObjectURL(file);
+  preview.classList.remove("hidden");
+});
+
+// IMAGE API
+async function checkImage() {
+
+  let file = document.getElementById("imageInput").files[0];
+
+  let formData = new FormData();
+  formData.append("file", file);
+
+  let res = await fetch("http://127.0.0.1:8000/check-image", {
+    method: "POST",
+    body: formData
+  });
+
+  let data = await res.json();
+
+  document.getElementById("imgResult").innerHTML = `
+    <div style="padding:15px; border-radius:10px; background:#111;">
+      <h3>GuardianAI Scan Result</h3>
+      <b>${data.decision}</b><br><br>
+      Nudity Score: ${data.nudity_score}<br>
+      Deepfake Score: ${data.deepfake_score}<br>
+      Evidence ID: ${data.evidence_hash}
+    </div>
+  `;
+}
+
+// TEXT API
+async function checkText() {
+
+  let text = document.getElementById("textInput").value;
+
+  let res = await fetch("http://127.0.0.1:8000/check-text?text=" + text, {
+    method: "POST"
+  });
+
+  let data = await res.json();
+
+  document.getElementById("textResult").innerHTML = `
+    <div style="padding:15px; border-radius:10px; background:#111;">
+      Toxicity: ${data.toxicity}<br>
+      Insult: ${data.insult}<br>
+      Threat: ${data.threat}<br><br>
+      <b>${data.decision}</b>
+    </div>
+  `;
+}
+
+</script>
+
+</body>
+</html>

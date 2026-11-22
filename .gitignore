@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment secrets
+.env
+.env.*
+
+# Keep the example configuration
+!.env.example
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Private evidence and uploads
+private_evidence/
+private_storage/
+uploads/
+
+# Testing and tools
+.pytest_cache/
+.coverage
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
