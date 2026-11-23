@@ -1,13 +1,25 @@
-
-from fastapi import FastAPI
+﻿from fastapi import FastAPI
 
 from backend.app.config import settings
+from backend.app.api.auth import router as auth_router
+from backend.app.api.admin import router as admin_router
 
 
 app = FastAPI(
     title=settings.APP_NAME,
     description="AI-powered digital abuse intelligence and evidence response platform.",
     version="1.0.0"
+)
+
+
+app.include_router(
+    auth_router,
+    prefix=settings.API_V1_PREFIX
+)
+
+app.include_router(
+    admin_router,
+    prefix=settings.API_V1_PREFIX
 )
 
 
