@@ -1,10 +1,12 @@
-"""Threat Assessment Submodule
-
-Contains taxonomy definitions, Pydantic v2 schemas, text preprocessing,
-analyzer interfaces, and Toxic-BERT model integration for SafeHER.
-"""
+"""SafeHER threat assessment submodule."""
 
 from ai_core.threat.analyzer import BaseThreatAnalyzer, DevelopmentThreatAnalyzer
+from ai_core.threat.highlighting import (
+    HighlightSegment,
+    partition_spans,
+    render_highlighted_html,
+    slice_utf16,
+)
 from ai_core.threat.preprocessing import PreprocessedText, preprocess_text
 from ai_core.threat.schemas import (
     AuxiliarySignal,
@@ -17,6 +19,7 @@ from ai_core.threat.schemas import (
 )
 from ai_core.threat.toxic_bert import (
     TOXIC_BERT_LABELS,
+    TOXIC_BERT_MAX_INPUT_TOKENS,
     ToxicBertModelRunner,
     ToxicBertResult,
     ToxicBertThreatAnalyzer,
@@ -38,4 +41,9 @@ __all__ = [
     "ToxicBertModelRunner",
     "ToxicBertResult",
     "TOXIC_BERT_LABELS",
+    "TOXIC_BERT_MAX_INPUT_TOKENS",
+    "HighlightSegment",
+    "partition_spans",
+    "render_highlighted_html",
+    "slice_utf16",
 ]

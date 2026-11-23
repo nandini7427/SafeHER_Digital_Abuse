@@ -311,9 +311,15 @@ class DevelopmentThreatAnalyzer(BaseThreatAnalyzer):
         for category, pattern, description in self.category_patterns:
             for match in pattern.finditer(working_text):
                 span_text = match.group(0)
+                span_start = match.start()
+                span_end = match.end()
+                start_utf16 = len(working_text[:span_start].encode("utf-16-le")) // 2
+                end_utf16 = len(working_text[:span_end].encode("utf-16-le")) // 2
                 span = FlaggedSpan(
-                    start=match.start(),
-                    end=match.end(),
+                    start=span_start,
+                    end=span_end,
+                    start_utf16=start_utf16,
+                    end_utf16=end_utf16,
                     text=span_text,
                     category=category,
                     explanation=description,
@@ -397,8 +403,24 @@ class DevelopmentThreatAnalyzer(BaseThreatAnalyzer):
             preprocessed=preprocessed,
         )
 
+        # Surface preprocessing changes to the caller so the UI can tell the
+        # user when the analysis copy differs from the original evidence.
+        if preprocessed.warnings:
+            explanation += (
+                " Preprocessing changed the analysis copy; see the "
+                "preprocessing_warnings field for details."
+            )
+
+        if preprocessed.is_truncated:
+            explanation += (
+                f" IMPORTANT: The input was truncated to {len(working_text)} characters "
+                "before analysis. Only the retained working copy was assessed; "
+                "the complete original message was not analyzed."
+            )
+
         return ThreatAssessmentResponse(
             assessment_id=uuid.uuid4(),
+            analyzed_text=working_text,
             threat_indicators=indicators,
             category_scores={},  # Intentionally empty: no fake calibrated model probabilities
             overall_threat_level=threat_level,
@@ -407,6 +429,8 @@ class DevelopmentThreatAnalyzer(BaseThreatAnalyzer):
             uncertainty_state=uncertainty,
             flagged_spans=flagged_spans,
             explanation=explanation,
+            preprocessing_warnings=list(preprocessed.warnings),
+            input_truncated=preprocessed.is_truncated,
         )
 
     def _is_extortion_demand(
@@ -564,6 +588,7 @@ class DevelopmentThreatAnalyzer(BaseThreatAnalyzer):
         has_exposure = ThreatCategory.EXPOSURE_THREAT in detected_categories
         has_extortion = ThreatCategory.FINANCIAL_EXTORTION in detected_categories
         has_coercion = ThreatCategory.COERCION in detected_categories
+        has_harassment = ThreatCategory.HARASSMENT_INTIMIDATION in detected_categories
 
         categories_str = ", ".join(c.value.replace("_", " ").title() for c in detected_categories)
 
@@ -588,20 +613,20 @@ class DevelopmentThreatAnalyzer(BaseThreatAnalyzer):
                 f"Elevated threat indicators detected ({categories_str}). "
                 f"Found {len(flagged_spans)} flagged span(s) indicating potential extortion, non-consensual exposure, or violence."
             )
-        elif has_coercion or has_exposure or has_extortion or has_blackmail:
+        elif has_coercion or has_exposure or has_extortion or has_blackmail or has_harassment:
             level = ThreatLevel.MEDIUM
             uncertainty = UncertaintyState.MODERATE
             explanation = (
                 f"Moderate threat indicators detected ({categories_str}). "
-                f"The text exhibits coercive demands or distribution threats across {len(flagged_spans)} flagged span(s)."
+                f"The text exhibits coercive demands, stalking/intimidation, or distribution threats across {len(flagged_spans)} flagged span(s)."
             )
         else:
-            # Only urgency pressure or harassment without explicit demands
+            # Only isolated urgency pressure without explicit threats or coercion
             level = ThreatLevel.LOW
             uncertainty = UncertaintyState.MODERATE
             explanation = (
                 f"Low-level or isolated pressure signals detected ({categories_str}). "
-                "No explicit physical threats or verified extortion ultimatums found."
+                "No explicit physical threats, stalking intimidation, or verified extortion ultimatums found."
             )
 
         return level, uncertainty, explanation

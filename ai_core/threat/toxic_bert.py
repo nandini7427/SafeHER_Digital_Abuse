@@ -1,8 +1,7 @@
-"""Toxic-BERT Model Integration for SafeHER Threat Assessment.
+"""Toxic-BERT model integration for SafeHER threat assessment.
 
-Integrates unitary/toxic-bert for multilabel toxicity and aggressive threat detection.
-Provides lazy model loading, raw uncalibrated sigmoid scoring, error handling,
-and CPU execution optimization for AMD Ryzen 5 systems.
+Toxic-BERT supplies auxiliary, uncalibrated toxicity signals only. SafeHER
+threat intent and severity continue to come from the baseline taxonomy analyzer.
 """
 
 import logging
@@ -10,23 +9,18 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from ai_core.config import ThreatAnalyzerConfig, default_ai_config
+from ai_core.config import ThreatAnalyzerConfig
 from ai_core.threat.analyzer import BaseThreatAnalyzer, DevelopmentThreatAnalyzer
-from ai_core.threat.preprocessing import PreprocessedText, preprocess_text
-from ai_core.threat.schemas import (
-    FlaggedSpan,
-    ThreatAssessmentResponse,
-    ThreatCategory,
-    ThreatIndicator,
-    ThreatLevel,
-    UncertaintyState,
-)
+from ai_core.threat.schemas import ThreatAssessmentResponse
 
 logger = logging.getLogger("safeher.ai.toxic_bert")
 
-# Standard 6 multilabel target classes for unitary/toxic-bert
+DEFAULT_TOXIC_BERT_MODEL_NAME = "unitary/toxic-bert"
+TOXIC_BERT_MODEL_REVISION = "4d6c22e74ba2fdd26bc4f7238f50766b045a0d94"
+TOXIC_BERT_MAX_INPUT_TOKENS = 512
+
 TOXIC_BERT_LABELS = [
     "toxic",
     "severe_toxic",
@@ -39,10 +33,9 @@ TOXIC_BERT_LABELS = [
 
 @dataclass(frozen=True)
 class ToxicBertResult:
-    """Raw multilabel output from Toxic-BERT inference.
+    """Raw multilabel output and token-coverage metadata from Toxic-BERT.
 
-    NOTE: Raw sigmoid scores are mathematical activations, NOT calibrated probabilities.
-    `is_calibrated` is explicitly False.
+    Raw sigmoid values are activations, not calibrated probabilities.
     """
 
     raw_logits: Dict[str, float]
@@ -51,19 +44,35 @@ class ToxicBertResult:
     model_name: str
     is_calibrated: bool = False
     labels: List[str] = field(default_factory=lambda: list(TOXIC_BERT_LABELS))
+    input_token_count: Optional[int] = None
+    max_input_tokens: int = TOXIC_BERT_MAX_INPUT_TOKENS
+    input_truncated: Optional[bool] = None
 
 
 class ToxicBertModelRunner:
-    """Lazy-loaded wrapper managing tokenization and inference for unitary/toxic-bert."""
+    """Lazy-loaded wrapper for the unitary/toxic-bert sequence classifier."""
 
     def __init__(
         self,
-        model_name: str = "unitary/toxic-bert",
+        model_name: str = DEFAULT_TOXIC_BERT_MODEL_NAME,
         device: str = "cpu",
         lazy_load: bool = True,
+        model_revision: Optional[str] = None,
+        max_input_tokens: int = TOXIC_BERT_MAX_INPUT_TOKENS,
     ) -> None:
-        self.model_name = model_name
+        if type(max_input_tokens) is not int or max_input_tokens <= 0:
+            raise ValueError("max_input_tokens must be a positive integer.")
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("model_name must be a non-empty string.")
+
+        self.model_name = model_name.strip()
         self.device = device
+        self.max_input_tokens = max_input_tokens
+        self.model_revision = (
+            model_revision
+            if model_revision is not None
+            else (TOXIC_BERT_MODEL_REVISION if self.model_name == DEFAULT_TOXIC_BERT_MODEL_NAME else None)
+        )
         self._tokenizer = None
         self._model = None
         self._is_loaded = False
@@ -81,10 +90,9 @@ class ToxicBertModelRunner:
         return self._load_error
 
     def load(self) -> bool:
-        """Lazily load tokenizer and sequence classification model on CPU."""
+        """Load tokenizer and model lazily; failures leave baseline analysis available."""
         if self._is_loaded:
             return True
-
         if self._load_error is not None:
             return False
 
@@ -92,84 +100,109 @@ class ToxicBertModelRunner:
             import torch
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            # Hardware-aware optimization for Ryzen 5 3450U:
-            # Constrain PyTorch thread count to prevent core saturation from degrading API latency
             torch.set_num_threads(min(4, os.cpu_count() or 4))
-
-            logger.info("Loading Toxic-BERT tokenizer and model from '%s' on %s...", self.model_name, self.device)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+            logger.info(
+                "Loading Toxic-BERT '%s' revision '%s' on %s.",
+                self.model_name,
+                self.model_revision or "library default",
+                self.device,
+            )
+            load_kwargs = {"revision": self.model_revision} if self.model_revision else {}
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, **load_kwargs)
+            self._model = AutoModelForSequenceClassification.from_pretrained(
+                self.model_name, **load_kwargs
+            )
             self._model.to(torch.device(self.device))
             self._model.eval()
-
             self._is_loaded = True
             logger.info("Toxic-BERT successfully initialized on %s.", self.device)
             return True
-
-        except Exception as exc:
+        except Exception as exc:  # Optional runtime dependency/model loading boundary.
             self._load_error = str(exc)
-            logger.warning("Toxic-BERT could not be loaded (%s). Running in heuristic fallback mode.", exc)
+            logger.warning("Toxic-BERT unavailable; using baseline analysis: %s", exc)
             return False
 
-    def predict(self, text: str) -> Optional[ToxicBertResult]:
-        """Execute CPU inference on normalized text copy.
+    @staticmethod
+    def _token_count(input_ids: object) -> int:
+        """Count unbatched or single-item batched tokenizer input IDs."""
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+            input_ids = input_ids[0]
+        if not isinstance(input_ids, (list, tuple)):
+            raise TypeError("Tokenizer input_ids must be a list-like sequence.")
+        return len(input_ids)
 
-        Returns:
-            ToxicBertResult containing raw logits and uncalibrated sigmoid scores,
-            or None if the model cannot be loaded.
-        """
+    def predict(self, text: str) -> Optional[ToxicBertResult]:
+        """Run inference and disclose whether model tokenization truncated the text."""
         if not self._is_loaded and not self.load():
             return None
 
-        import numpy as np
-        import torch
+        started = time.perf_counter()
+        try:
+            import numpy as np
+            import torch
 
-        start_time = time.perf_counter()
+            # Count tokens before truncation so the response can disclose coverage.
+            full_encoding = self._tokenizer(
+                text,
+                add_special_tokens=True,
+                truncation=False,
+                padding=False,
+            )
+            token_count = self._token_count(full_encoding["input_ids"])
+            token_truncated = token_count > self.max_input_tokens
 
-        # Tokenize input text (truncating at 512 tokens max)
-        inputs = self._tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding=False,
-        )
-        inputs = {k: v.to(torch.device(self.device)) for k, v in inputs.items()}
+            inputs = self._tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_input_tokens,
+                padding=False,
+            )
+            inputs = {key: value.to(torch.device(self.device)) for key, value in inputs.items()}
 
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits[0].cpu().numpy()
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+                logits = outputs.logits[0].detach().cpu().numpy()
 
-        # Compute element-wise sigmoid: σ(x) = 1 / (1 + exp(-x))
-        sigmoid_scores = 1.0 / (1.0 + np.exp(-logits))
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            if len(logits) != len(TOXIC_BERT_LABELS):
+                raise ValueError(
+                    f"Expected {len(TOXIC_BERT_LABELS)} Toxic-BERT logits; received {len(logits)}."
+                )
 
-        raw_logits_dict = {
-            label: float(round(logits[i], 4))
-            for i, label in enumerate(TOXIC_BERT_LABELS)
-        }
-        raw_sigmoid_dict = {
-            label: float(round(sigmoid_scores[i], 4))
-            for i, label in enumerate(TOXIC_BERT_LABELS)
-        }
+            with np.errstate(over="ignore"):
+                sigmoid_scores = 1.0 / (1.0 + np.exp(-logits))
 
-        return ToxicBertResult(
-            raw_logits=raw_logits_dict,
-            raw_sigmoid_scores=raw_sigmoid_dict,
-            inference_time_ms=round(elapsed_ms, 2),
-            model_name=self.model_name,
-            is_calibrated=False,  # Raw sigmoid is uncalibrated
-        )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logits_by_label = {
+                label: float(round(float(logits[index]), 4))
+                for index, label in enumerate(TOXIC_BERT_LABELS)
+            }
+            scores_by_label = {
+                label: float(round(float(sigmoid_scores[index]), 4))
+                for index, label in enumerate(TOXIC_BERT_LABELS)
+            }
+
+            return ToxicBertResult(
+                raw_logits=logits_by_label,
+                raw_sigmoid_scores=scores_by_label,
+                inference_time_ms=round(elapsed_ms, 2),
+                model_name=self.model_name,
+                is_calibrated=False,
+                input_token_count=token_count,
+                max_input_tokens=self.max_input_tokens,
+                input_truncated=token_truncated,
+            )
+        except Exception:
+            logger.exception(
+                "Toxic-BERT inference failed; returning no neural result so baseline analysis can be used."
+            )
+            return None
 
 
 class ToxicBertThreatAnalyzer(BaseThreatAnalyzer):
-    """Hybrid threat analyzer combining SafeHER taxonomy patterns with real Toxic-BERT inference.
-
-    - Uses pattern-based span highlighting for extortion, blackmail, and coercive control.
-    - Uses Toxic-BERT for neural multi-label toxicity and aggressive threat scoring.
-    - Gracefully handles missing model weights or offline environments.
-    - Guarantees `is_calibrated=False` so raw sigmoid values are never shown as probabilities.
-    """
+    """Hybrid analyzer: rule-based threat intent plus auxiliary Toxic-BERT signals."""
 
     def __init__(
         self,
@@ -178,74 +211,93 @@ class ToxicBertThreatAnalyzer(BaseThreatAnalyzer):
     ) -> None:
         super().__init__(config=config)
         self.model_runner = model_runner or ToxicBertModelRunner(
-            model_name=self.config.model_name_or_path or "unitary/toxic-bert",
+            model_name=self.config.model_name_or_path or DEFAULT_TOXIC_BERT_MODEL_NAME,
             device=self.config.device,
             lazy_load=True,
         )
-        # Use development baseline for initial pattern & span extraction
         self.baseline_analyzer = DevelopmentThreatAnalyzer(config=self.config)
 
     def analyze(self, text: str) -> ThreatAssessmentResponse:
-        """Run complete hybrid assessment using preprocessing, patterns, and Toxic-BERT."""
-        # 1. Run baseline assessment for 7-category taxonomy & explainable text spans
+        """Assess threat intent first, then optionally enrich with Toxic-BERT signals."""
         base_response = self.baseline_analyzer.analyze(text)
 
-        preprocessed = preprocess_text(
-            text,
-            max_length=self.config.max_input_length,
-            min_length=self.config.min_input_length,
-        )
-        working_text = preprocessed.working_copy
-
-        # 2. Run Toxic-BERT neural model inference
-        toxic_result: Optional[ToxicBertResult] = self.model_runner.predict(working_text)
-
-        # 3. Merge neural signals if model inference succeeded
-        category_scores: Dict[str, float] = {}
-        indicators = list(base_response.threat_indicators)
-        explanation = base_response.explanation
-        uncertainty = base_response.uncertainty_state
-        level = base_response.overall_threat_level
-
-        if toxic_result is not None:
-            # Map raw sigmoid scores with explicit model prefix
-            for label, score in toxic_result.raw_sigmoid_scores.items():
-                category_scores[f"toxic_bert:{label}"] = score
-
-            neural_threat = toxic_result.raw_sigmoid_scores.get("threat", 0.0)
-            neural_toxic = toxic_result.raw_sigmoid_scores.get("toxic", 0.0)
-            neural_insult = toxic_result.raw_sigmoid_scores.get("insult", 0.0)
-
-            # Check if neural model identified high threat not captured by baseline lexical patterns
-            if neural_threat > 0.6 and not any(ind.category == ThreatCategory.DIRECT_THREAT for ind in indicators):
-                indicators.append(
-                    ThreatIndicator(
-                        category=ThreatCategory.DIRECT_THREAT,
-                        indicator_type="neural_classification",
-                        text=f"toxic_bert:threat score={neural_threat:.2f}",
-                        explanation=f"Neural model identified elevated threat aggression (raw sigmoid: {neural_threat:.2f}).",
+        if not self.config.enable_toxicity_check:
+            return base_response.model_copy(
+                update={
+                    "explanation": (
+                        base_response.explanation
+                        + " Toxic-BERT auxiliary analysis was disabled by configuration."
                     )
-                )
-                if level == ThreatLevel.NONE:
-                    level = ThreatLevel.MEDIUM
-                elif level == ThreatLevel.LOW:
-                    level = ThreatLevel.HIGH
-
-            explanation += (
-                f" [Toxic-BERT inference: {toxic_result.inference_time_ms:.1f}ms (CPU). "
-                f"Raw uncalibrated toxicity: {neural_toxic:.2f}, threat: {neural_threat:.2f}, insult: {neural_insult:.2f}]."
+                }
             )
-        else:
-            explanation += " [Toxic-BERT offline or unavailable; assessment generated via baseline pattern rules]."
+
+        # Reuse the exact working copy already analyzed by the baseline; do not
+        # preprocess raw evidence a second time or create divergent model inputs.
+        analyzed_text = base_response.analyzed_text
+        try:
+            toxic_result: Optional[ToxicBertResult] = self.model_runner.predict(analyzed_text)
+        except Exception:
+            logger.exception("Toxic-BERT runner raised unexpectedly; retaining baseline assessment.")
+            toxic_result = None
+
+        if toxic_result is None:
+            return base_response.model_copy(
+                update={
+                    "explanation": (
+                        base_response.explanation
+                        + " Toxic-BERT offline or unavailable, or inference failed; the assessment uses baseline pattern rules."
+                    )
+                }
+            )
+
+        category_scores = {
+            f"toxic_bert:{label}": score
+            for label, score in toxic_result.raw_sigmoid_scores.items()
+        }
+        neural_threat = toxic_result.raw_sigmoid_scores.get("threat", 0.0)
+        neural_toxic = toxic_result.raw_sigmoid_scores.get("toxic", 0.0)
+        neural_insult = toxic_result.raw_sigmoid_scores.get("insult", 0.0)
+
+        explanation = (
+            base_response.explanation
+            + f" [Toxic-BERT inference: {toxic_result.inference_time_ms:.1f}ms (CPU). "
+            + f"Raw uncalibrated toxicity: {neural_toxic:.2f}, "
+            + f"threat: {neural_threat:.2f}, insult: {neural_insult:.2f}."
+        )
+        if toxic_result.input_truncated is True:
+            if toxic_result.input_token_count is None:
+                explanation += (
+                    f" Toxic-BERT may have truncated its input at {toxic_result.max_input_tokens} tokens; "
+                    "the runner did not report the full token count. The baseline pattern analyzer "
+                    "evaluated the full analyzed_text."
+                )
+            else:
+                explanation += (
+                    f" Toxic-BERT evaluated only the first {toxic_result.max_input_tokens} tokens "
+                    f"of {toxic_result.input_token_count}; later tokens were not evaluated by the neural model. "
+                    "The baseline pattern analyzer evaluated the full analyzed_text."
+                )
+        elif toxic_result.input_token_count is not None:
+            explanation += (
+                f" Toxic-BERT tokenized {toxic_result.input_token_count} tokens "
+                f"within its {toxic_result.max_input_tokens}-token limit."
+            )
+        explanation += "]"
 
         return ThreatAssessmentResponse(
             assessment_id=uuid.uuid4(),
-            threat_indicators=indicators,
+            analyzed_text=base_response.analyzed_text,
+            threat_indicators=list(base_response.threat_indicators),
             category_scores=category_scores,
-            overall_threat_level=level,
-            is_calibrated=False,  # Explicitly uncalibrated
+            overall_threat_level=base_response.overall_threat_level,
+            is_calibrated=False,
             confidence_score=None,
-            uncertainty_state=uncertainty,
-            flagged_spans=base_response.flagged_spans,
+            uncertainty_state=base_response.uncertainty_state,
+            flagged_spans=list(base_response.flagged_spans),
             explanation=explanation,
+            preprocessing_warnings=list(base_response.preprocessing_warnings),
+            input_truncated=base_response.input_truncated,
+            toxic_bert_input_truncated=toxic_result.input_truncated,
+            toxic_bert_input_token_count=toxic_result.input_token_count,
+            toxic_bert_max_input_tokens=toxic_result.max_input_tokens,
         )

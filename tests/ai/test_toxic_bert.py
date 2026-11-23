@@ -7,13 +7,18 @@ Tests comply strictly with Milestone 2 constraints:
 - Verifies evaluation metrics (Precision, Recall, F1, Confusion Matrix).
 """
 
+import json
+import shutil
+import subprocess
 from typing import Dict, List, Optional
 import pytest
 
 from ai_core.evaluation.dataset import BENCHMARK_DATASET, BenchmarkSample
+from ai_core.config import ThreatAnalyzerConfig
 from ai_core.evaluation.evaluator import (
     ClassificationMetrics,
     EvaluationReport,
+    _compute_metrics,
     evaluate_analyzer,
 )
 from ai_core.threat.analyzer import DevelopmentThreatAnalyzer
@@ -108,6 +113,49 @@ def test_toxic_bert_model_unavailable_graceful_fallback():
     assert res.confidence_score is None
 
 
+
+def test_toxic_bert_predict_handles_tokenization_failure(monkeypatch):
+    """Verify tokenizer/runtime errors return None instead of crashing inference."""
+    import sys
+    from types import ModuleType
+
+    # Stub optional ML imports so this test does not require PyTorch or model weights.
+    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
+    monkeypatch.setitem(sys.modules, "numpy", ModuleType("numpy"))
+
+    runner = ToxicBertModelRunner(model_name="mock/toxic-bert", lazy_load=True)
+    runner._is_loaded = True
+
+    def failing_tokenizer(*args, **kwargs):
+        raise RuntimeError("simulated tokenizer failure")
+
+    runner._tokenizer = failing_tokenizer
+    runner._model = object()
+
+    assert runner.predict("A harmless test message") is None
+
+
+def test_toxic_bert_analyzer_falls_back_when_runner_raises():
+    """Verify an unexpected runner exception does not interrupt baseline assessment."""
+
+    class FailingPredictionRunner:
+        def predict(self, text: str) -> Optional[ToxicBertResult]:
+            raise RuntimeError("simulated inference failure")
+
+    analyzer = ToxicBertThreatAnalyzer(model_runner=FailingPredictionRunner())
+    result = analyzer.analyze("I will track you down and hurt you.")
+
+    assert result.overall_threat_level in [ThreatLevel.HIGH, ThreatLevel.SEVERE]
+    assert any(
+        indicator.category == ThreatCategory.DIRECT_THREAT
+        for indicator in result.threat_indicators
+    )
+    assert result.category_scores == {}
+    assert "offline or unavailable" in result.explanation
+    assert result.is_calibrated is False
+    assert result.confidence_score is None
+
+
 # =============================================================================
 # 2. Multilabel Classification & Uncalibrated Scores Tests
 # =============================================================================
@@ -139,6 +187,37 @@ def test_toxic_bert_multilabel_scores_and_uncalibrated_flag():
 
     # Verify inference timing is reported
     assert "Toxic-BERT inference: 18.4ms" in res.explanation
+
+
+def test_toxic_bert_high_neural_threat_score_does_not_escalate_harmless_text():
+    """A high uncalibrated Toxic-BERT score must not independently create a threat."""
+    simulated = {
+        "toxic": 0.05,
+        "severe_toxic": 0.01,
+        "obscene": 0.02,
+        "threat": 0.95,
+        "insult": 0.03,
+        "identity_hate": 0.01,
+    }
+    mock_runner = MockToxicBertModelRunner(simulated_scores=simulated)
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+
+    res = analyzer.analyze(
+        "The team completed the project successfully and shared the report."
+    )
+
+    # The rule-based assessment remains authoritative for threat category/severity.
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert all(
+        indicator.category != ThreatCategory.DIRECT_THREAT
+        for indicator in res.threat_indicators
+    )
+
+    # Keep the neural score as an auxiliary, explicitly uncalibrated signal.
+    assert res.category_scores["toxic_bert:threat"] == pytest.approx(0.95)
+    assert res.is_calibrated is False
+    assert res.confidence_score is None
+    assert "Raw uncalibrated" in res.explanation
 
 
 # =============================================================================
@@ -463,3 +542,254 @@ def test_toxic_bert_scoped_ultimatum_matching_separate_sentence_threat():
     assert ThreatCategory.BLACKMAIL in detected
     assert ThreatCategory.EXPOSURE_THREAT in detected
     assert ThreatCategory.FINANCIAL_EXTORTION not in detected
+
+
+# =============================================================================
+# 9. Evaluation Metric Correctness and Input Validation Tests
+# =============================================================================
+
+def test_compute_metrics_returns_expected_confusion_matrix_and_scores():
+    """Verify precision, recall, F1, and accuracy against a known example."""
+    metrics = _compute_metrics(
+        y_true=[True, True, False, False],
+        y_pred=[True, False, True, False],
+    )
+
+    assert metrics.true_positives == 1
+    assert metrics.false_positives == 1
+    assert metrics.true_negatives == 1
+    assert metrics.false_negatives == 1
+    assert metrics.precision == pytest.approx(0.5)
+    assert metrics.recall == pytest.approx(0.5)
+    assert metrics.f1_score == pytest.approx(0.5)
+    assert metrics.accuracy == pytest.approx(0.5)
+
+
+def test_compute_metrics_rejects_different_input_lengths():
+    """Avoid silently truncating metric inputs through zip()."""
+    with pytest.raises(ValueError, match="same number of items"):
+        _compute_metrics(y_true=[True, False], y_pred=[True])
+
+
+def test_compute_metrics_rejects_empty_inputs():
+    """Avoid returning apparently valid zero metrics for no samples."""
+    with pytest.raises(ValueError, match="empty dataset"):
+        _compute_metrics(y_true=[], y_pred=[])
+
+
+def test_evaluate_analyzer_rejects_explicitly_empty_dataset():
+    """An empty custom list must not silently select the bundled benchmark."""
+    analyzer = DevelopmentThreatAnalyzer()
+
+    with pytest.raises(ValueError, match="at least one sample"):
+        evaluate_analyzer(analyzer, samples=[])
+
+
+def test_evaluate_analyzer_omits_toxicity_metrics_when_model_scores_are_partial():
+    """Do not report toxicity metrics when the model omitted scores for a sample."""
+
+    class MissingOneScoreRunner(MockToxicBertModelRunner):
+        def predict(self, text: str) -> Optional[ToxicBertResult]:
+            if text == BENCHMARK_DATASET[0].text:
+                self.call_count += 1
+                return None
+            return super().predict(text)
+
+    analyzer = ToxicBertThreatAnalyzer(model_runner=MissingOneScoreRunner())
+    samples = BENCHMARK_DATASET[:2]
+
+    report = evaluate_analyzer(analyzer, samples=samples)
+
+    assert report.sample_count == 2
+    assert report.toxicity_metrics is None
+
+
+def test_evaluate_analyzer_reports_toxicity_metrics_when_all_scores_exist():
+    """Verify toxicity metrics are available when every sample has a score."""
+    analyzer = ToxicBertThreatAnalyzer(model_runner=MockToxicBertModelRunner())
+    report = evaluate_analyzer(analyzer, samples=BENCHMARK_DATASET[:2])
+
+    assert report.toxicity_metrics is not None
+    metrics = report.toxicity_metrics
+    assert (
+        metrics.true_positives
+        + metrics.false_positives
+        + metrics.true_negatives
+        + metrics.false_negatives
+    ) == report.sample_count
+
+
+# =============================================================================
+# 10. Hybrid Analyzer Preprocessing Metadata Propagation Tests
+# =============================================================================
+
+def test_toxic_bert_analyzer_propagates_preprocessing_warnings():
+    """The hybrid response must expose sanitization warnings from the baseline."""
+    analyzer = ToxicBertThreatAnalyzer(model_runner=MockToxicBertModelRunner())
+    original_text = "Please review this message\u200b carefully."
+
+    result = analyzer.analyze(original_text)
+
+    assert result.preprocessing_warnings
+    assert any("zero-width" in warning.lower() for warning in result.preprocessing_warnings)
+    assert result.input_truncated is False
+    assert "preprocessing_warnings" in result.explanation
+
+
+def test_toxic_bert_analyzer_propagates_truncation_metadata():
+    """The hybrid response must disclose when the baseline truncated the input."""
+    config = ThreatAnalyzerConfig(max_input_length=20, min_input_length=1)
+    analyzer = ToxicBertThreatAnalyzer(
+        config=config,
+        model_runner=MockToxicBertModelRunner(),
+    )
+    original_text = "This is a much longer harmless message than twenty characters."
+
+    result = analyzer.analyze(original_text)
+
+    assert result.input_truncated is True
+    assert any("exceeded 20 characters" in warning for warning in result.preprocessing_warnings)
+    assert "complete original message was not analyzed" in result.explanation
+
+
+# =============================================================================
+# Model revision pinning tests
+# =============================================================================
+
+
+def test_default_toxic_bert_loads_tokenizer_and_model_from_pinned_revision(monkeypatch):
+    """The default public model and tokenizer must use the same immutable revision."""
+    import sys
+    from types import ModuleType
+
+    from ai_core.threat.toxic_bert import TOXIC_BERT_MODEL_REVISION
+
+    calls = {}
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            calls["tokenizer"] = {"model_name": model_name, **kwargs}
+            return object()
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            calls["model"] = {"model_name": model_name, **kwargs}
+            return cls()
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return None
+
+    fake_torch = ModuleType("torch")
+    fake_torch.set_num_threads = lambda count: None
+    fake_torch.device = lambda device: device
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoTokenizer = FakeTokenizer
+    fake_transformers.AutoModelForSequenceClassification = FakeModel
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    runner = ToxicBertModelRunner(lazy_load=True)
+    assert runner.load() is True
+
+    assert runner.model_name == "unitary/toxic-bert"
+    assert runner.model_revision == TOXIC_BERT_MODEL_REVISION
+    assert calls["tokenizer"] == {
+        "model_name": "unitary/toxic-bert",
+        "revision": TOXIC_BERT_MODEL_REVISION,
+    }
+    assert calls["model"] == {
+        "model_name": "unitary/toxic-bert",
+        "revision": TOXIC_BERT_MODEL_REVISION,
+    }
+
+
+def test_custom_toxic_bert_model_does_not_receive_unrelated_default_revision():
+    """A custom model ID must not inherit unitary/toxic-bert's revision."""
+    runner = ToxicBertModelRunner(
+        model_name="example/custom-toxic-model",
+        lazy_load=True,
+    )
+
+    assert runner.model_revision is None
+
+
+def test_custom_toxic_bert_model_can_receive_explicit_revision():
+    """Custom model IDs can be pinned by their caller to a matching revision."""
+    runner = ToxicBertModelRunner(
+        model_name="example/custom-toxic-model",
+        lazy_load=True,
+        model_revision="0123456789abcdef0123456789abcdef01234567",
+    )
+
+    assert runner.model_revision == "0123456789abcdef0123456789abcdef01234567"
+
+
+# =============================================================================
+# 14. Analyzed Text and UTF-16 Offset Consistency for ToxicBertThreatAnalyzer
+# =============================================================================
+
+def test_toxic_bert_analyzed_text_field_and_utf16_offsets():
+    """Verify ToxicBertThreatAnalyzer sets analyzed_text and consistent UTF-16 span offsets."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.20, "severe_toxic": 0.05, "obscene": 0.05, "threat": 0.30, "insult": 0.10, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+
+    text = "Look 📸🚨 Send me 500 dollars or I will publish your private photos."
+    res = analyzer.analyze(text)
+
+    # analyzed_text must be populated and match working copy
+    assert res.analyzed_text
+    assert "Send me 500 dollars" in res.analyzed_text
+    assert len(res.flagged_spans) > 0
+
+    node_bin = shutil.which("node")
+
+    for span in res.flagged_spans:
+        # Python code-point slicing
+        assert res.analyzed_text[span.start : span.end] == span.text
+
+        # UTF-16 offsets validation
+        assert span.start_utf16 is not None
+        assert span.end_utf16 is not None
+        assert span.start_utf16 >= 0
+        assert span.end_utf16 >= span.start_utf16
+
+        # UTF-16 byte-level slicing in Python
+        utf16_bytes = res.analyzed_text.encode("utf-16-le")
+        py_utf16_slice = utf16_bytes[span.start_utf16 * 2 : span.end_utf16 * 2].decode("utf-16-le")
+        assert py_utf16_slice == span.text
+
+        # Live Node.js verification if available
+        if node_bin:
+            js_code = (
+                f"const text = {json.dumps(res.analyzed_text)};\n"
+                f"const slice = text.slice({span.start_utf16}, {span.end_utf16});\n"
+                f"if (slice !== {json.dumps(span.text)}) {{\n"
+                f"  console.error('JS mismatch: expected', {json.dumps(span.text)}, 'got', slice);\n"
+                f"  process.exit(1);\n"
+                f"}}\n"
+            )
+            proc = subprocess.run([node_bin, "-e", js_code], capture_output=True, text=True)
+            assert proc.returncode == 0, f"Node.js slice mismatch: {proc.stderr}"
+
+
+def test_toxic_bert_truncated_input_analyzed_text():
+    """Verify ToxicBertThreatAnalyzer correctly preserves input_truncated metadata and analyzed_text."""
+    short_config = ThreatAnalyzerConfig(max_input_length=50)
+    mock_runner = MockToxicBertModelRunner()
+    analyzer = ToxicBertThreatAnalyzer(config=short_config, model_runner=mock_runner)
+
+    long_text = "A" * 80 + " Send me 500 dollars or I will expose you."
+    res = analyzer.analyze(long_text)
+
+    assert res.input_truncated is True
+    assert len(res.analyzed_text) <= 50
+    assert any("truncated" in w.lower() for w in res.preprocessing_warnings)

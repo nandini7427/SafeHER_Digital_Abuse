@@ -1,8 +1,10 @@
-"""Documented validation benchmark dataset for SafeHER threat assessment.
+"""Small synthetic development benchmark for SafeHER threat assessment.
 
-Contains carefully curated, synthetic, non-confidential test examples
-designed to evaluate threat intent detection, false-positive resistance (figurative language),
-and the separation between toxicity and extortion.
+Contains non-confidential examples for initial checks of threat-intent
+detection, false-positive resistance (figurative language), and the separation
+between toxicity and extortion. This limited hand-crafted dataset is useful for
+regression testing, but it is not representative of real-world use and must not
+be used to claim production-level accuracy.
 """
 
 from dataclasses import dataclass
@@ -17,7 +19,8 @@ class BenchmarkSample:
         sample_id: Unique identifier.
         text: Synthetic sample text.
         is_threat: Ground truth for threat intent (violence, blackmail, extortion, coercion).
-        is_toxic: Ground truth for coarse vulgarity or insults.
+        is_toxic: Ground truth for coarse abusive language (vulgarity or insults),
+            independent of threat intent.
         primary_category: Categorical taxonomy label.
         rationale: Why this sample is labeled this way.
     """
@@ -36,7 +39,7 @@ BENCHMARK_DATASET: List[BenchmarkSample] = [
         sample_id="DT_01",
         text="I know where you live and I will track you down and hurt you.",
         is_threat=True,
-        is_toxic=True,
+        is_toxic=False,
         primary_category="direct_threat",
         rationale="Explicit threat of physical tracking and bodily injury.",
     ),
@@ -44,7 +47,7 @@ BENCHMARK_DATASET: List[BenchmarkSample] = [
         sample_id="DT_02",
         text="You are going to die tomorrow if you show up here.",
         is_threat=True,
-        is_toxic=True,
+        is_toxic=False,
         primary_category="direct_threat",
         rationale="Direct death threat specifying temporal condition.",
     ),
