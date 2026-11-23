@@ -248,3 +248,218 @@ def test_benchmark_evaluation_runner():
     # Latency and memory metrics must be valid positive values
     assert report.avg_latency_ms > 0
     assert report.memory_rss_mb > 0
+
+
+# =============================================================================
+# 6. Extortion Gap Remediation Tests for ToxicBertThreatAnalyzer
+# =============================================================================
+
+@pytest.mark.parametrize(
+    "text,expected_categories",
+    [
+        (
+            "Send me 500 dollars by midnight or I will publish your private photos.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+                ThreatCategory.URGENCY_PRESSURE,
+            },
+        ),
+        (
+            "Unless you transfer 1000 dollars, I will forward your private photos to your employer.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+            },
+        ),
+        (
+            "Pay me ₹500 or I will leak your intimate videos.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+            },
+        ),
+    ],
+)
+def test_toxic_bert_remediated_extortion_positive_cases(text, expected_categories):
+    """Verify ToxicBertThreatAnalyzer recognizes remediated extortion and exposure patterns."""
+    # Simulate low coarse toxicity to prove structural extortion detection functions independently
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.08, "severe_toxic": 0.01, "obscene": 0.02, "threat": 0.15, "insult": 0.05, "identity_hate": 0.01}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level in [ThreatLevel.HIGH, ThreatLevel.SEVERE]
+    detected = {span.category for span in res.flagged_spans}
+    for cat in expected_categories:
+        assert cat in detected, f"Expected category {cat} missing from detected: {detected}"
+
+
+@pytest.mark.parametrize(
+    "harmless_text",
+    [
+        "Please send me 500 dollars for the concert tickets.",
+        "I will publish my new photography collection tomorrow.",
+        "Please transfer the money for our group dinner.",
+    ],
+)
+def test_toxic_bert_ordinary_requests_and_harmless_photos_negative_cases(harmless_text):
+    """Verify ToxicBertThreatAnalyzer does not elevate harmless payment/photo requests."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.01, "severe_toxic": 0.0, "obscene": 0.0, "threat": 0.01, "insult": 0.01, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    res = analyzer.analyze(harmless_text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+
+
+# =============================================================================
+# 7. Milestone 2 Final Review Regression Tests for ToxicBertThreatAnalyzer
+# =============================================================================
+
+def test_toxic_bert_unrelated_payment_and_separate_exposure_threat():
+    """Verify ToxicBertThreatAnalyzer handles unrelated concert payment and separate exposure threat."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.05, "severe_toxic": 0.0, "obscene": 0.01, "threat": 0.08, "insult": 0.02, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "Please send me 500 dollars for the concert tickets. If you report me, I will send your private photos to your family."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.HIGH
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.BLACKMAIL in detected_categories
+    assert ThreatCategory.EXPOSURE_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected_categories
+
+
+def test_toxic_bert_direct_threat_combined_with_extortion():
+    """Verify ToxicBertThreatAnalyzer handles direct threat combined with extortion at SEVERE level."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.75, "severe_toxic": 0.30, "obscene": 0.20, "threat": 0.85, "insult": 0.40, "identity_hate": 0.05}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "Pay me 1000 dollars or I will track you down and hurt you."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.SEVERE
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.DIRECT_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected_categories
+    assert ThreatCategory.BLACKMAIL in detected_categories
+
+
+def test_toxic_bert_exposure_threat_without_financial_demand():
+    """Verify ToxicBertThreatAnalyzer handles standalone exposure threat at MEDIUM level."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.12, "severe_toxic": 0.02, "obscene": 0.05, "threat": 0.18, "insult": 0.04, "identity_hate": 0.01}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "I will leak your intimate videos to everyone."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.MEDIUM
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.EXPOSURE_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected_categories
+
+
+# =============================================================================
+# 8. Final Edge-Case Remediation Tests for ToxicBertThreatAnalyzer
+# =============================================================================
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Please pay me before midnight for the rent.",
+        "Please complete the wire transfer before Friday for invoice 204.",
+        "Please transfer the requested cryptocurrency to our registered vendor wallet.",
+    ],
+)
+def test_toxic_bert_deadlines_alone_not_extortion_negative_cases(text):
+    """Issue 1: Verify routine payment requests with deadlines alone are NOT classified as extortion."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.01, "severe_toxic": 0.0, "obscene": 0.0, "threat": 0.01, "insult": 0.01, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
+    assert ThreatCategory.URGENCY_PRESSURE not in detected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Pay the ransom of 5000 dollars.",
+        "Pay 1000 dollars to stop the leak.",
+    ],
+)
+def test_toxic_bert_genuine_extortion_demands_using_ransom_preserved(text):
+    """Issue 1: Verify genuine extortion demands using ransom or duress language are preserved."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.25, "severe_toxic": 0.05, "obscene": 0.05, "threat": 0.35, "insult": 0.05, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level in [ThreatLevel.MEDIUM, ThreatLevel.HIGH, ThreatLevel.SEVERE]
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected
+
+
+def test_toxic_bert_scoped_ultimatum_matching_unrelated_publication():
+    """Issue 2: Verify forward consequence search does not match unrelated statement far later or benign publication."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.02, "severe_toxic": 0.0, "obscene": 0.0, "threat": 0.01, "insult": 0.01, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "Send me 500 dollars for concert tickets. Or I will publish my private photography collection tomorrow."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
+    assert ThreatCategory.EXPOSURE_THREAT not in detected
+
+
+def test_toxic_bert_scoped_ultimatum_matching_direct_consequence():
+    """Issue 2: Verify forward consequence search detects direct conditional extortion consequence."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.30, "severe_toxic": 0.10, "obscene": 0.10, "threat": 0.45, "insult": 0.15, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "Send me 500 dollars, or I will publish your private photos."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.SEVERE
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected
+    assert ThreatCategory.BLACKMAIL in detected
+    assert ThreatCategory.EXPOSURE_THREAT in detected
+
+
+def test_toxic_bert_scoped_ultimatum_matching_separate_sentence_threat():
+    """Issue 2: Verify routine dinner payment is NOT extortion when threat in subsequent sentence is condition on reporting."""
+    mock_runner = MockToxicBertModelRunner(
+        simulated_scores={"toxic": 0.15, "severe_toxic": 0.05, "obscene": 0.02, "threat": 0.25, "insult": 0.05, "identity_hate": 0.0}
+    )
+    analyzer = ToxicBertThreatAnalyzer(model_runner=mock_runner)
+    text = "Please transfer 500 dollars for dinner. If you report me, I will share your private photos."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.HIGH
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.BLACKMAIL in detected
+    assert ThreatCategory.EXPOSURE_THREAT in detected
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
