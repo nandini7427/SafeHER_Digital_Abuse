@@ -206,3 +206,273 @@ def test_structured_output_schema_and_disclaimer(analyzer):
     assert isinstance(json_output, str)
     assert "assessment_id" in json_output
     assert "is_calibrated" in json_output
+
+
+# =============================================================================
+# 9. Extortion Detection Remediation Tests (Positive & Negative Scenarios)
+# =============================================================================
+
+@pytest.mark.parametrize(
+    "text,expected_categories",
+    [
+        (
+            "Send me 500 dollars by midnight or I will publish your private photos.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+                ThreatCategory.URGENCY_PRESSURE,
+            },
+        ),
+        (
+            "Unless you transfer 1000 dollars, I will forward your private photos to your employer.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+            },
+        ),
+        (
+            "Pay me ₹500 or I will leak your intimate videos.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+            },
+        ),
+        (
+            "Transfer the money, otherwise I will expose your private videos.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+                ThreatCategory.FINANCIAL_EXTORTION,
+            },
+        ),
+        (
+            "If you report me, I will send your private photos to your family.",
+            {
+                ThreatCategory.BLACKMAIL,
+                ThreatCategory.EXPOSURE_THREAT,
+            },
+        ),
+    ],
+)
+def test_remediated_extortion_positive_cases(analyzer, text, expected_categories):
+    """Verify detection of previously missed extortion, exposure, and conditional threat structures."""
+    res: ThreatAssessmentResponse = analyzer.analyze(text)
+
+    # Must be categorized as HIGH or SEVERE threat
+    assert res.overall_threat_level in [ThreatLevel.HIGH, ThreatLevel.SEVERE]
+    assert res.is_calibrated is False
+    assert res.confidence_score is None
+
+    detected = {span.category for span in res.flagged_spans}
+    for cat in expected_categories:
+        assert cat in detected, f"Expected category {cat} missing from detected: {detected}"
+
+    # Character offsets must match exact substrings in working text copy
+    preprocessed = preprocess_text(text)
+    for span in res.flagged_spans:
+        assert preprocessed.working_copy[span.start : span.end] == span.text
+
+
+@pytest.mark.parametrize(
+    "harmless_text",
+    [
+        "Please send me 500 dollars for the concert tickets.",
+        "I will publish my new photography collection tomorrow.",
+        "Please transfer the money for our group dinner.",
+        "I sent 500 dollars for the rent yesterday. Feel free to publish your vacation photos.",
+        "Could you please transfer 20 dollars to split the lunch bill?",
+    ],
+)
+def test_ordinary_requests_and_harmless_photos_negative_cases(analyzer, harmless_text):
+    """Verify ordinary payment requests and harmless photography statements are NOT elevated to threat alerts."""
+    res: ThreatAssessmentResponse = analyzer.analyze(harmless_text)
+
+    # Must NOT be classified as extortion or threat
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    assert len(res.threat_indicators) == 0
+    assert ThreatCategory.FINANCIAL_EXTORTION not in [s.category for s in res.flagged_spans]
+    assert ThreatCategory.EXPOSURE_THREAT not in [s.category for s in res.flagged_spans]
+    assert ThreatCategory.BLACKMAIL not in [s.category for s in res.flagged_spans]
+
+
+# =============================================================================
+# 10. Milestone 2 Final Review Regression Tests (Context Separation & Severity)
+# =============================================================================
+
+def test_unrelated_payment_and_separate_exposure_threat(analyzer):
+    """Regression Test 1: Unrelated concert-ticket payment and separate exposure threat.
+
+    Verifies that a benign concert ticket payment mention is NOT categorized as financial
+    extortion, while the separate blackmail and exposure threat is correctly detected at HIGH severity.
+    """
+    text = "Please send me 500 dollars for the concert tickets. If you report me, I will send your private photos to your family."
+    res = analyzer.analyze(text)
+
+    # Severity must be HIGH (blackmail + exposure threat, but NO extortion)
+    assert res.overall_threat_level == ThreatLevel.HIGH
+    assert res.uncertainty_state == UncertaintyState.LOW
+    assert res.is_calibrated is False
+
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.BLACKMAIL in detected_categories
+    assert ThreatCategory.EXPOSURE_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected_categories
+
+    flagged_texts = [s.text for s in res.flagged_spans]
+    assert "If you report me" in flagged_texts
+    assert "send your private photos to your family" in flagged_texts
+    assert not any("500 dollars" in t for t in flagged_texts)
+
+
+def test_conditional_financial_blackmail_ultimatum(analyzer):
+    """Regression Test 2: Original conditional financial blackmail example.
+
+    Verifies full detection of financial extortion, blackmail, exposure threat, and urgency
+    at SEVERE threat level.
+    """
+    text = "Send me 500 dollars by midnight or I will publish your private photos."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.SEVERE
+    assert res.uncertainty_state == UncertaintyState.LOW
+    assert res.is_calibrated is False
+
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected_categories
+    assert ThreatCategory.BLACKMAIL in detected_categories
+    assert ThreatCategory.EXPOSURE_THREAT in detected_categories
+    assert ThreatCategory.URGENCY_PRESSURE in detected_categories
+
+    flagged_texts = [s.text for s in res.flagged_spans]
+    assert any("500 dollars" in t for t in flagged_texts)
+    assert any("publish your private photos" in t for t in flagged_texts)
+
+
+def test_ordinary_payment_with_unrelated_harmless_publication(analyzer):
+    """Regression Test 3: Ordinary payment with unrelated harmless publication statement.
+
+    Verifies that combining dinner payment with photography publication does NOT trigger threat alerts.
+    """
+    text = "Please transfer 500 dollars for the dinner. I will publish my new photography collection tomorrow."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    assert len(res.threat_indicators) == 0
+    assert res.uncertainty_state == UncertaintyState.LOW
+
+
+def test_exposure_threat_without_financial_demand(analyzer):
+    """Regression Test 4: Exposure threat without a financial demand.
+
+    Verifies that an unconsented exposure threat alone is categorized at MEDIUM severity.
+    """
+    text = "I will leak your intimate videos to everyone."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.MEDIUM
+    assert res.uncertainty_state == UncertaintyState.MODERATE
+
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.EXPOSURE_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected_categories
+    assert ThreatCategory.BLACKMAIL not in detected_categories
+
+
+def test_direct_threat_combined_with_extortion(analyzer):
+    """Regression Test 5: Direct threat combined with extortion.
+
+    Verifies that combining direct bodily harm with financial extortion yields SEVERE severity.
+    """
+    text = "Pay me 1000 dollars or I will track you down and hurt you."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.SEVERE
+    assert res.uncertainty_state == UncertaintyState.LOW
+
+    detected_categories = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.DIRECT_THREAT in detected_categories
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected_categories
+    assert ThreatCategory.BLACKMAIL in detected_categories
+
+
+# =============================================================================
+# 11. Final Edge-Case Remediation Tests (Deadlines & Scoped Ultimatum Matching)
+# =============================================================================
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Please pay me before midnight for the rent.",
+        "Please complete the wire transfer before Friday for invoice 204.",
+        "Please transfer the requested cryptocurrency to our registered vendor wallet.",
+    ],
+)
+def test_deadlines_alone_not_extortion_negative_cases(analyzer, text):
+    """Issue 1: Verify routine payment requests with deadlines alone are NOT classified as extortion or urgency abuse."""
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    assert len(res.threat_indicators) == 0
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
+    assert ThreatCategory.URGENCY_PRESSURE not in detected
+    assert ThreatCategory.BLACKMAIL not in detected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Pay the ransom of 5000 dollars.",
+        "Pay 1000 dollars to stop the leak.",
+    ],
+)
+def test_genuine_extortion_demands_using_ransom_preserved(analyzer, text):
+    """Issue 1: Verify genuine extortion demands using ransom or duress language are preserved."""
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level in [ThreatLevel.MEDIUM, ThreatLevel.HIGH, ThreatLevel.SEVERE]
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected
+
+
+def test_scoped_ultimatum_matching_unrelated_publication(analyzer):
+    """Issue 2: Verify forward consequence search does not match unrelated statement far later or benign publication."""
+    text = "Send me 500 dollars for concert tickets. Or I will publish my private photography collection tomorrow."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.NONE
+    assert len(res.flagged_spans) == 0
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
+    assert ThreatCategory.EXPOSURE_THREAT not in detected
+    assert ThreatCategory.BLACKMAIL not in detected
+
+
+def test_scoped_ultimatum_matching_direct_consequence(analyzer):
+    """Issue 2: Verify forward consequence search detects direct conditional extortion consequence."""
+    text = "Send me 500 dollars, or I will publish your private photos."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.SEVERE
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.FINANCIAL_EXTORTION in detected
+    assert ThreatCategory.BLACKMAIL in detected
+    assert ThreatCategory.EXPOSURE_THREAT in detected
+
+
+def test_scoped_ultimatum_matching_separate_sentence_threat(analyzer):
+    """Issue 2: Verify routine dinner payment is NOT extortion when threat in subsequent sentence is condition on reporting."""
+    text = "Please transfer 500 dollars for dinner. If you report me, I will share your private photos."
+    res = analyzer.analyze(text)
+
+    assert res.overall_threat_level == ThreatLevel.HIGH
+    detected = {span.category for span in res.flagged_spans}
+    assert ThreatCategory.BLACKMAIL in detected
+    assert ThreatCategory.EXPOSURE_THREAT in detected
+    assert ThreatCategory.FINANCIAL_EXTORTION not in detected
