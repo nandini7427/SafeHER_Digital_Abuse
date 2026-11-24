@@ -1,8 +1,13 @@
-﻿from datetime import datetime
+﻿
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+
+# --------------------------------------------------
+# Authentication Schemas
+# --------------------------------------------------
 
 class UserRegister(BaseModel):
     email: str = Field(min_length=5, max_length=254)
@@ -41,4 +46,62 @@ class UserResponse(BaseModel):
     email: str
     role: str
     is_active: bool
+    created_at: datetime
+
+
+# --------------------------------------------------
+# Case Management Schemas
+# --------------------------------------------------
+
+class CaseCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Case title cannot be empty.")
+
+        return value
+
+
+class CaseUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=5000)
+    status: str | None = Field(default=None, min_length=1, max_length=30)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.strip()
+
+            if not value:
+                raise ValueError("Case title cannot be empty.")
+
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.strip()
+
+            if not value:
+                raise ValueError("Case status cannot be empty.")
+
+        return value
+
+
+class CaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    owner_id: UUID
+    title: str
+    description: str | None
+    status: str
     created_at: datetime
