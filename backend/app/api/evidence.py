@@ -17,6 +17,10 @@ from backend.app.services.evidence import save_evidence_file
 router = APIRouter(prefix="/evidence", tags=["Evidence"])
 
 
+# --------------------------------------------------
+# 1. Upload evidence with duplicate detection
+# --------------------------------------------------
+
 @router.post(
     "/cases/{case_id}",
     status_code=status.HTTP_201_CREATED,
@@ -69,8 +73,36 @@ async def upload_evidence(
     storage_key = None
 
     try:
+        # Save the file and calculate its SHA-256 hash.
         storage_key, file_size, file_hash = await save_evidence_file(file)
 
+        # Check whether this user has already uploaded identical content.
+        # Duplicate detection applies across all cases owned by this user.
+        duplicate = db.scalar(
+            select(Evidence.id).where(
+                Evidence.owner_id == current_user.id,
+                Evidence.sha256 == file_hash,
+            )
+        )
+
+        if duplicate is not None:
+            # Delete the newly saved duplicate file.
+            storage_path = (
+                Path(settings.PRIVATE_STORAGE_PATH).resolve()
+                / storage_key
+            )
+            storage_path.unlink(missing_ok=True)
+            storage_key = None
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Duplicate evidence detected. "
+                    "This file has already been uploaded."
+                ),
+            )
+
+        # Create the evidence database record.
         evidence = Evidence(
             case_id=case.id,
             owner_id=current_user.id,
@@ -84,6 +116,7 @@ async def upload_evidence(
         db.add(evidence)
         db.flush()
 
+        # Record successful uploads in the audit log.
         audit_entry = AuditLog(
             user_id=current_user.id,
             action="evidence_uploaded",
@@ -105,6 +138,18 @@ async def upload_evidence(
             "sha256": evidence.sha256,
             "uploaded_at": evidence.uploaded_at,
         }
+
+    except HTTPException:
+        db.rollback()
+
+        if storage_key:
+            storage_path = (
+                Path(settings.PRIVATE_STORAGE_PATH).resolve()
+                / storage_key
+            )
+            storage_path.unlink(missing_ok=True)
+
+        raise
 
     except ValueError as exc:
         db.rollback()
@@ -133,6 +178,10 @@ async def upload_evidence(
             detail="Evidence upload failed.",
         ) from exc
 
+
+# --------------------------------------------------
+# 2. List evidence belonging to a case
+# --------------------------------------------------
 
 @router.get("/cases/{case_id}")
 def list_case_evidence(
@@ -181,6 +230,10 @@ def list_case_evidence(
     }
 
 
+# --------------------------------------------------
+# 3. Download evidence securely
+# --------------------------------------------------
+
 @router.get("/{evidence_id}/download")
 def download_evidence(
     evidence_id: UUID,
@@ -227,7 +280,10 @@ def download_evidence(
 
     if (
         not download_filename
-        or any(ord(char) < 32 or ord(char) == 127 for char in download_filename)
+        or any(
+            ord(char) < 32 or ord(char) == 127
+            for char in download_filename
+        )
     ):
         download_filename = "evidence"
 

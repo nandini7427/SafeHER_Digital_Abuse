@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from backend.app.config import settings
 from backend.app.database import Base, get_db
 from backend.app.main import app
-from backend.app.models import AuditLog, Case
+from backend.app.models import AuditLog, Case, Evidence
 
 
 # --------------------------------------------------
@@ -582,3 +582,231 @@ def test_download_missing_evidence_file_returns_404(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Evidence file not found."
+
+
+# --------------------------------------------------
+# 13. Same user cannot upload identical evidence twice
+# --------------------------------------------------
+
+def test_duplicate_evidence_upload_is_rejected(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "duplicate-test@example.com",
+    )
+
+    case_id = create_case(test_db, user_id)
+    file_content = b"SafeHER duplicate evidence test"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 409
+    assert "Duplicate evidence detected" in second_upload.json()["detail"]
+
+    # Only the original file should remain.
+    assert len(list(private_storage.iterdir())) == 1
+
+    evidence_records = test_db.scalars(
+        select(Evidence).where(
+            Evidence.owner_id == user_id
+        )
+    ).all()
+
+    assert len(evidence_records) == 1
+
+    audit_entries = test_db.scalars(
+        select(AuditLog).where(
+            AuditLog.user_id == user_id,
+            AuditLog.action == "evidence_uploaded",
+        )
+    ).all()
+
+    assert len(audit_entries) == 1
+
+
+# --------------------------------------------------
+# 14. Duplicate detection works across different filenames
+# --------------------------------------------------
+
+def test_duplicate_evidence_with_different_filename_is_rejected(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "duplicate-filename@example.com",
+    )
+
+    case_id = create_case(test_db, user_id)
+    file_content = b"Identical content with different filenames"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "original.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "renamed.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 409
+    assert len(list(private_storage.iterdir())) == 1
+
+
+# --------------------------------------------------
+# 15. Duplicate detection works across different cases
+# --------------------------------------------------
+
+def test_duplicate_evidence_across_different_cases_is_rejected(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "duplicate-cases@example.com",
+    )
+
+    first_case_id = create_case(test_db, user_id)
+    second_case_id = create_case(test_db, user_id)
+
+    file_content = b"Same evidence uploaded to two cases"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{first_case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{second_case_id}",
+        headers=headers,
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 409
+    assert len(list(private_storage.iterdir())) == 1
+
+
+# --------------------------------------------------
+# 16. Different users can upload identical evidence
+# --------------------------------------------------
+
+def test_different_users_can_upload_identical_evidence(
+    client,
+    test_db,
+    private_storage,
+):
+    user_one_id, user_one_token = register_and_login(
+        client,
+        "duplicate-user-one@example.com",
+    )
+
+    user_two_id, user_two_token = register_and_login(
+        client,
+        "duplicate-user-two@example.com",
+    )
+
+    user_one_case = create_case(test_db, user_one_id)
+    user_two_case = create_case(test_db, user_two_id)
+
+    file_content = b"Identical evidence for different users"
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{user_one_case}",
+        headers={"Authorization": f"Bearer {user_one_token}"},
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{user_two_case}",
+        headers={"Authorization": f"Bearer {user_two_token}"},
+        files={
+            "file": (
+                "proof.txt",
+                file_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 201
+
+    # Each user should have their own stored copy.
+    assert len(list(private_storage.iterdir())) == 2
+
+    evidence_records = test_db.scalars(
+        select(Evidence)
+    ).all()
+
+    assert len(evidence_records) == 2
