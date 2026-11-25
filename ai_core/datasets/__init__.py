@@ -1,0 +1,248 @@
+"""SafeHER Dataset Registry, Manifest Schema, Integrity, Provenance, Splitting, and Rights Validation Engine.
+
+Provides the foundation for legally traceable, reproducible, and commercially
+responsible image dataset pipelines.
+"""
+
+from ai_core.datasets.adjudication import (
+    AdjudicatedDatasetRecord,
+    AnnotatorVote,
+    ConsensusStatus,
+    LabelQualityAuditReport,
+    LabelValidationPipeline,
+    NormalizedForensicLabel,
+    TaskEligibilityMask,
+    compute_inter_annotator_agreement,
+)
+from ai_core.datasets.auditor import (
+    AuditFinding,
+    DatasetAuditReport,
+    DatasetAuditor,
+)
+from ai_core.datasets.duplicates import (
+    DuplicateDetectionReport,
+    DuplicateDetector,
+    ExactDuplicateCluster,
+    NearDuplicateCandidate,
+    compute_dhash,
+    compute_phash,
+    hamming_distance,
+    perceptual_similarity,
+)
+from ai_core.datasets.integrity import (
+    CorruptedFileError,
+    FileIntegrityError,
+    ImageFileMetadata,
+    InvalidFormatError,
+    PathTraversalError,
+    compute_file_sha256,
+    compute_stream_sha256,
+    resolve_safe_relative_path,
+    validate_image_file,
+    verify_file_sha256,
+)
+from ai_core.datasets.leakage import (
+    LeakageAuditReport,
+    LeakageDetector,
+    LeakageType,
+    LeakageViolation,
+)
+from ai_core.datasets.manifest import (
+    CURRENT_SCHEMA_VERSION,
+    AttributionMetadata,
+    CommercialUseStatus,
+    ConsentStatus,
+    DatasetImageLabel,
+    DatasetImageRecord,
+    DatasetManifest,
+    DatasetSplit,
+    DatasetTaskType,
+    GeneratorInfo,
+    GroundTruthLabel,
+    ManipulationCategory,
+    ResearchUseStatus,
+    RightsApprovalStatus,
+    TargetUsageScope,
+    TransformationStep,
+    UsageScope,
+    compute_sha256,
+    validate_dataset_path_or_ref,
+    validate_non_identifying_consent_reference,
+)
+from ai_core.datasets.loader import (
+    BINARY_LABEL_MAP,
+    MULTICLASS_LABEL_MAP,
+    SafeHERDataset,
+    SampleExclusionRecord,
+    create_safe_dataloader,
+    safe_collate_fn,
+)
+from ai_core.datasets.provenance import (
+    ProvenanceGraph,
+    ProvenanceViolation,
+    ProvenanceViolationType,
+    create_derived_variant_record,
+    verify_provenance_consistency,
+)
+from ai_core.datasets.readiness_auditor import (
+    DatasetReadinessAuditor,
+    DatasetReadinessReport,
+    QuantitativeDatasetStatistics,
+    ReadinessVerificationCheck,
+    TrackVerdict,
+    build_forensic_benchmark_manifest,
+    run_readiness_audit,
+)
+from ai_core.datasets.registry import (
+    DATASET_REGISTRY,
+    CandidateCategory,
+    CandidateDatasetProfile,
+    create_candidate_sample_record,
+    create_initial_registry_manifest,
+    get_dataset_profile,
+    list_all_candidates,
+    list_commercial_candidates,
+    list_research_only_candidates,
+)
+from ai_core.datasets.rights_validator import (
+    RightsReviewStatus,
+    RightsValidationEngine,
+    RightsViolation,
+    ValidationReport,
+    ValidationSeverity,
+)
+from ai_core.datasets.splitter import (
+    DatasetLeakageError,
+    GroupAwareDatasetSplitter,
+    SplitPolicy,
+    SplitResult,
+    UnionFind,
+)
+from ai_core.datasets.transforms import (
+    ForensicTransformPipeline,
+    ReproducibleColorVariation,
+    ReproducibleControlledNoise,
+    ReproducibleCrop,
+    ReproducibleFaceCrop,
+    ReproducibleJPEGRecompression,
+    ReproducibleMildBlur,
+    ReproducibleResize,
+    ToTensorAndNormalize,
+    TransformOperationRecord,
+)
+
+__all__ = [
+    # Schema version
+    "CURRENT_SCHEMA_VERSION",
+    # Manifest & Records
+    "AttributionMetadata",
+    "CommercialUseStatus",
+    "ConsentStatus",
+    "DatasetImageLabel",
+    "DatasetImageRecord",
+    "DatasetManifest",
+    "DatasetSplit",
+    "DatasetTaskType",
+    "GeneratorInfo",
+    "GroundTruthLabel",
+    "ManipulationCategory",
+    "ResearchUseStatus",
+    "RightsApprovalStatus",
+    "TargetUsageScope",
+    "TransformationStep",
+    "UsageScope",
+    "compute_sha256",
+    "validate_dataset_path_or_ref",
+    "validate_non_identifying_consent_reference",
+    # Integrity & Hashing
+    "CorruptedFileError",
+    "FileIntegrityError",
+    "ImageFileMetadata",
+    "InvalidFormatError",
+    "PathTraversalError",
+    "compute_file_sha256",
+    "compute_stream_sha256",
+    "resolve_safe_relative_path",
+    "validate_image_file",
+    "verify_file_sha256",
+    # Provenance
+    "ProvenanceGraph",
+    "ProvenanceViolation",
+    "ProvenanceViolationType",
+    "create_derived_variant_record",
+    "verify_provenance_consistency",
+    # Duplicates & Perceptual Hashing
+    "DuplicateDetectionReport",
+    "DuplicateDetector",
+    "ExactDuplicateCluster",
+    "NearDuplicateCandidate",
+    "compute_dhash",
+    "compute_phash",
+    "hamming_distance",
+    "perceptual_similarity",
+    # Auditor
+    "AuditFinding",
+    "DatasetAuditReport",
+    "DatasetAuditor",
+    # Splitting & Leakage Prevention
+    "DatasetLeakageError",
+    "GroupAwareDatasetSplitter",
+    "SplitPolicy",
+    "SplitResult",
+    "UnionFind",
+    "LeakageAuditReport",
+    "LeakageDetector",
+    "LeakageType",
+    "LeakageViolation",
+    # Rights Validator
+    "RightsReviewStatus",
+    "RightsValidationEngine",
+    "RightsViolation",
+    "ValidationReport",
+    "ValidationSeverity",
+    # Registry
+    "CandidateCategory",
+    "CandidateDatasetProfile",
+    "DATASET_REGISTRY",
+    "create_candidate_sample_record",
+    "create_initial_registry_manifest",
+    "get_dataset_profile",
+    "list_all_candidates",
+    "list_commercial_candidates",
+    "list_research_only_candidates",
+    # Forensic Transforms & Pipeline
+    "ForensicTransformPipeline",
+    "ReproducibleColorVariation",
+    "ReproducibleControlledNoise",
+    "ReproducibleCrop",
+    "ReproducibleFaceCrop",
+    "ReproducibleJPEGRecompression",
+    "ReproducibleMildBlur",
+    "ReproducibleResize",
+    "ToTensorAndNormalize",
+    "TransformOperationRecord",
+    # Reproducible Loader & Batching
+    "BINARY_LABEL_MAP",
+    "MULTICLASS_LABEL_MAP",
+    "SafeHERDataset",
+    "SampleExclusionRecord",
+    "create_safe_dataloader",
+    "safe_collate_fn",
+    # Dataset Readiness & Acceptance Auditor
+    "DatasetReadinessAuditor",
+    "DatasetReadinessReport",
+    "QuantitativeDatasetStatistics",
+    "ReadinessVerificationCheck",
+    "TrackVerdict",
+    "build_forensic_benchmark_manifest",
+    "run_readiness_audit",
+    # Advanced Label Reliability & Adjudication
+    "NormalizedForensicLabel",
+    "ConsensusStatus",
+    "AnnotatorVote",
+    "TaskEligibilityMask",
+    "AdjudicatedDatasetRecord",
+    "LabelValidationPipeline",
+    "LabelQualityAuditReport",
+    "compute_inter_annotator_agreement",
+]
