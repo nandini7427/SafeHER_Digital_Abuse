@@ -8,6 +8,8 @@ Tests comply strictly with Milestone 2 constraints:
 """
 
 import json
+import threading
+import time
 import shutil
 import subprocess
 from typing import Dict, List, Optional
@@ -96,6 +98,65 @@ def test_toxic_bert_lazy_loading():
     """Verify that model is NOT loaded at instantiation time."""
     runner = ToxicBertModelRunner(model_name="unitary/toxic-bert", lazy_load=True)
     assert runner.is_loaded is False
+
+
+def test_toxic_bert_concurrent_load_thread_safety(monkeypatch):
+    """Verify concurrent threads calling load() do not duplicate model initialization."""
+    import sys
+    from types import ModuleType
+
+    load_calls = 0
+    lock = threading.Lock()
+
+    class FakeTokenizer:
+        pass
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    def fake_from_pretrained(*args, **kwargs):
+        nonlocal load_calls
+        with lock:
+            load_calls += 1
+        time.sleep(0.01)
+        return FakeModel()
+
+    def fake_tok_from_pretrained(*args, **kwargs):
+        return FakeTokenizer()
+
+    transformers_stub = ModuleType("transformers")
+    transformers_stub.AutoTokenizer = type(
+        "AutoTokenizer", (), {"from_pretrained": staticmethod(fake_tok_from_pretrained)}
+    )
+    transformers_stub.AutoModelForSequenceClassification = type(
+        "AutoModelForSequenceClassification", (), {"from_pretrained": staticmethod(fake_from_pretrained)}
+    )
+
+    torch_stub = ModuleType("torch")
+    torch_stub.set_num_threads = lambda n: None
+    torch_stub.device = lambda d: d
+
+    monkeypatch.setitem(sys.modules, "transformers", transformers_stub)
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+
+    runner = ToxicBertModelRunner(model_name="mock/thread-test", lazy_load=True)
+
+    threads = []
+    for _ in range(10):
+        t = threading.Thread(target=runner.load)
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert runner.is_loaded is True
+    assert load_calls == 1
 
 
 def test_toxic_bert_model_unavailable_graceful_fallback():

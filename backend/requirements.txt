@@ -33,7 +33,7 @@ pytest==9.2.0
 python-dotenv==1.2.4
 python-multipart==0.0.34
 PyYAML==6.0.4
-regex>=2024.11.6,<2027.0
+regex==2026.11.19
 SQLAlchemy==2.1.9
 starlette==1.10.0
 typing-inspection==0.4.5

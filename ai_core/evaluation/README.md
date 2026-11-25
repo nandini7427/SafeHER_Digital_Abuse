@@ -1,10 +1,7 @@
-# SafeHER AI/ML — Evaluation Framework
+# Evaluation scripts and generated outputs
 
-## Purpose
-This directory hosts benchmark datasets, evaluation protocols, and validation scripts for SafeHER threat assessment and digital abuse detection pipelines.
+This directory contains evaluation utilities and generated reports. Generated outputs must always be interpreted with their generation script, dataset source, run configuration and limitations.
 
-## Evaluation Principles
-1. **No Fabricated Benchmarks**: Evaluation metrics (Precision, Recall, F1, AUROC) must only be reported when computed against real, verified test runs on benchmark datasets.
-2. **Synthetic / Sanitized Evaluation Data**: Never use unredacted real victim records or sensitive personal data for testing or model benchmarking.
-3. **Calibration & Uncertainty**: Evaluate models not only on accuracy but also on Expected Calibration Error (ECE) and uncertainty reliability under out-of-distribution inputs.
-4. **Figurative & Idiomatic Robustness**: Benchmarks include stress tests with common idioms, slang, and figurative speech to measure and minimize false positive rates.
+In particular, `per_image_evaluation_results.csv` is a controlled/fixture benchmark artifact from the repository's evaluation harness. It is **not** an independent real-world test set and does not measure the performance of full-scale trained Model A or Model B checkpoints. The M4 checkpoints needed for such a benchmark were not supplied in this repository. Do not quote this CSV as production or survivor-case accuracy.
+
+`benchmark_results.json` contains host-specific measurements and must be regenerated on the deployment target before making resource/latency claims. `sbom.json` is a generated software inventory snapshot; regenerate it when dependencies or the build environment change.

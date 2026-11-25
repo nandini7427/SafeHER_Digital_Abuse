@@ -189,3 +189,141 @@ class AuditLog(Base):
         default=current_time,
         nullable=False
     )
+
+
+class ImageReview(Base):
+    __tablename__ = "image_reviews"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("evidence.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("cases.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    requester_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    reviewer_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        default="pending",
+        nullable=False,
+    )
+
+    ai_assessment_snapshot: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    request_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    human_verdict: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    reviewer_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    disagreement_rationale: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    is_disagreement_with_ai: Mapped[bool] = mapped_column(
+        default=False,
+        nullable=False,
+    )
+
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=current_time,
+        nullable=False,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class EvidenceCleanupLease(Base):
+    """Database-backed cleanup claim and lease record for orphan evidence reconciliation.
+
+    Tracks files claimed for cleanup, preventing concurrent deletion of active uploads,
+    enabling quarantine audits, crash recovery, and state transitions.
+    """
+    __tablename__ = "evidence_cleanup_leases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        primary_key=True,
+        default=uuid.uuid4
+    )
+
+    storage_key: Mapped[str] = mapped_column(
+        String(255),
+        index=True,
+        nullable=False
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="CLAIMED",
+        nullable=False
+    )  # CLAIMED, QUARANTINED, RESTORED, PURGED, ABORTED
+
+    action: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False
+    )  # "quarantine" or "purge"
+
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=current_time,
+        nullable=False
+    )
+
+    lease_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True
+    )
+
+    notes: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True
+    )

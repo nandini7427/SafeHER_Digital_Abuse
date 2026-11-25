@@ -6,6 +6,7 @@ threat intent and severity continue to come from the baseline taxonomy analyzer.
 
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ class ToxicBertModelRunner:
         self._model = None
         self._is_loaded = False
         self._load_error: Optional[str] = None
+        self._load_lock = threading.Lock()
 
         if not lazy_load:
             self.load()
@@ -96,31 +98,37 @@ class ToxicBertModelRunner:
         if self._load_error is not None:
             return False
 
-        try:
-            import torch
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        with self._load_lock:
+            if self._is_loaded:
+                return True
+            if self._load_error is not None:
+                return False
 
-            torch.set_num_threads(min(4, os.cpu_count() or 4))
-            logger.info(
-                "Loading Toxic-BERT '%s' revision '%s' on %s.",
-                self.model_name,
-                self.model_revision or "library default",
-                self.device,
-            )
-            load_kwargs = {"revision": self.model_revision} if self.model_revision else {}
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, **load_kwargs)
-            self._model = AutoModelForSequenceClassification.from_pretrained(
-                self.model_name, **load_kwargs
-            )
-            self._model.to(torch.device(self.device))
-            self._model.eval()
-            self._is_loaded = True
-            logger.info("Toxic-BERT successfully initialized on %s.", self.device)
-            return True
-        except Exception as exc:  # Optional runtime dependency/model loading boundary.
-            self._load_error = str(exc)
-            logger.warning("Toxic-BERT unavailable; using baseline analysis: %s", exc)
-            return False
+            try:
+                import torch
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+                torch.set_num_threads(min(4, os.cpu_count() or 4))
+                logger.info(
+                    "Loading Toxic-BERT '%s' revision '%s' on %s.",
+                    self.model_name,
+                    self.model_revision or "library default",
+                    self.device,
+                )
+                load_kwargs = {"revision": self.model_revision} if self.model_revision else {}
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, **load_kwargs)
+                self._model = AutoModelForSequenceClassification.from_pretrained(
+                    self.model_name, **load_kwargs
+                )
+                self._model.to(torch.device(self.device))
+                self._model.eval()
+                self._is_loaded = True
+                logger.info("Toxic-BERT successfully initialized on %s.", self.device)
+                return True
+            except Exception as exc:  # Optional runtime dependency/model loading boundary.
+                self._load_error = str(exc)
+                logger.warning("Toxic-BERT unavailable; using baseline analysis: %s", exc)
+                return False
 
     @staticmethod
     def _token_count(input_ids: object) -> int:
