@@ -936,3 +936,61 @@ def test_different_users_can_upload_identical_evidence(
     ).all()
 
     assert len(evidence_records) == 2
+
+
+# --------------------------------------------------
+# 19. Modified evidence file fails integrity verification
+# --------------------------------------------------
+
+def test_modified_evidence_file_download_is_blocked(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "tampered-evidence@example.com",
+    )
+
+    grant_evidence_consent(client, token)
+
+    case_id = create_case(test_db, user_id)
+    original_content = b"Original SafeHER evidence"
+
+    upload_response = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "proof.txt",
+                original_content,
+                "text/plain",
+            ),
+        },
+    )
+
+    assert upload_response.status_code == 201
+    evidence_id = upload_response.json()["id"]
+
+    evidence = test_db.scalar(
+        select(Evidence).where(
+            Evidence.id == UUID(evidence_id)
+        )
+    )
+
+    assert evidence is not None
+
+    # Simulate unauthorized modification of the stored evidence.
+    stored_file = private_storage / evidence.storage_key
+    stored_file.write_bytes(b"Modified evidence content")
+
+    # The backend must detect the hash mismatch and block download.
+    response = client.get(
+        f"/api/v1/evidence/{evidence_id}/download",
+        headers=auth_headers(token),
+    )
+
+    assert response.status_code == 409
+    assert "integrity verification failed" in (
+        response.json()["detail"].lower()
+    )

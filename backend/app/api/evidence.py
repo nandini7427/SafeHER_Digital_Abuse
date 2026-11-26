@@ -1,3 +1,6 @@
+
+import hashlib
+import hmac
 from pathlib import Path
 from uuid import UUID
 
@@ -33,7 +36,6 @@ async def upload_evidence(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Validate the original filename.
     original_filename = (
         (file.filename or "").replace("\\", "/").split("/")[-1]
     )
@@ -49,7 +51,6 @@ async def upload_evidence(
             detail="Invalid filename.",
         )
 
-    # Check that the case belongs to the logged-in user.
     case = db.scalar(
         select(Case).where(
             Case.id == case_id,
@@ -63,7 +64,6 @@ async def upload_evidence(
             detail="Case not found.",
         )
 
-    # Require active consent before saving evidence.
     if not has_active_consent(
         db=db,
         user_id=current_user.id,
@@ -77,7 +77,6 @@ async def upload_evidence(
             ),
         )
 
-    # MIME type is client-provided metadata.
     mime_type = file.content_type or "application/octet-stream"
 
     if len(mime_type) > 100:
@@ -89,11 +88,8 @@ async def upload_evidence(
     storage_key = None
 
     try:
-        # Save the file and calculate its SHA-256 hash.
         storage_key, file_size, file_hash = await save_evidence_file(file)
 
-        # Check whether this user has already uploaded identical content.
-        # Duplicate detection applies across all cases owned by this user.
         duplicate = db.scalar(
             select(Evidence.id).where(
                 Evidence.owner_id == current_user.id,
@@ -102,7 +98,6 @@ async def upload_evidence(
         )
 
         if duplicate is not None:
-            # Delete the newly saved duplicate file.
             storage_path = (
                 Path(settings.PRIVATE_STORAGE_PATH).resolve()
                 / storage_key
@@ -118,7 +113,6 @@ async def upload_evidence(
                 ),
             )
 
-        # Create the evidence database record.
         evidence = Evidence(
             case_id=case.id,
             owner_id=current_user.id,
@@ -132,7 +126,6 @@ async def upload_evidence(
         db.add(evidence)
         db.flush()
 
-        # Record successful uploads in the audit log.
         audit_entry = AuditLog(
             user_id=current_user.id,
             action="evidence_uploaded",
@@ -215,7 +208,6 @@ def list_case_evidence(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Verify case ownership.
     case = db.scalar(
         select(Case).where(
             Case.id == case_id,
@@ -229,7 +221,6 @@ def list_case_evidence(
             detail="Case not found.",
         )
 
-    # Retrieve only evidence belonging to this user's case.
     evidence_records = db.scalars(
         select(Evidence)
         .where(
@@ -257,7 +248,7 @@ def list_case_evidence(
 
 
 # --------------------------------------------------
-# 3. Download evidence securely
+# 3. Download evidence with SHA-256 integrity verification
 # --------------------------------------------------
 
 @router.get("/{evidence_id}/download")
@@ -266,7 +257,6 @@ def download_evidence(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Retrieve only evidence owned by the logged-in user.
     evidence = db.scalar(
         select(Evidence).where(
             Evidence.id == evidence_id,
@@ -280,11 +270,9 @@ def download_evidence(
             detail="Evidence not found.",
         )
 
-    # Resolve the private storage directory and requested file.
     storage_dir = Path(settings.PRIVATE_STORAGE_PATH).resolve()
     storage_path = (storage_dir / evidence.storage_key).resolve()
 
-    # Prevent path traversal or access through an unexpected location.
     if storage_path.parent != storage_dir:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -297,7 +285,41 @@ def download_evidence(
             detail="Evidence file not found.",
         )
 
-    # Use a safe display filename, not the internal storage key.
+    # Calculate SHA-256 from the stored evidence file.
+    sha256_hash = hashlib.sha256()
+
+    try:
+        with storage_path.open("rb") as evidence_file:
+            for chunk in iter(
+                lambda: evidence_file.read(1024 * 1024),
+                b"",
+            ):
+                sha256_hash.update(chunk)
+
+    except OSError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to verify evidence integrity.",
+        )
+
+    calculated_hash = sha256_hash.hexdigest()
+
+    # Block download if the file has been modified or has no stored hash.
+    if (
+        not evidence.sha256
+        or not hmac.compare_digest(
+            calculated_hash,
+            evidence.sha256,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Evidence integrity verification failed. "
+                "Download blocked."
+            ),
+        )
+
     download_filename = (
         (evidence.original_filename or "")
         .replace("\\", "/")
