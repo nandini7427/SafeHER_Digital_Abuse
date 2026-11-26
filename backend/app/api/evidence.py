@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from uuid import UUID
 
@@ -11,14 +10,17 @@ from backend.app.config import settings
 from backend.app.database import get_db
 from backend.app.models import AuditLog, Case, Evidence, User
 from backend.app.security.dependencies import get_current_user
+from backend.app.services.consent import has_active_consent
 from backend.app.services.evidence import save_evidence_file
 
 
 router = APIRouter(prefix="/evidence", tags=["Evidence"])
 
+REQUIRED_EVIDENCE_CONSENT = "Evidence analysis"
+
 
 # --------------------------------------------------
-# 1. Upload evidence with duplicate detection
+# 1. Upload evidence with consent and duplicate detection
 # --------------------------------------------------
 
 @router.post(
@@ -59,6 +61,20 @@ async def upload_evidence(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Case not found.",
+        )
+
+    # Require active consent before saving evidence.
+    if not has_active_consent(
+        db=db,
+        user_id=current_user.id,
+        purpose=REQUIRED_EVIDENCE_CONSENT,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Active consent for Evidence analysis is required "
+                "before uploading evidence."
+            ),
         )
 
     # MIME type is client-provided metadata.
@@ -154,6 +170,13 @@ async def upload_evidence(
     except ValueError as exc:
         db.rollback()
 
+        if storage_key:
+            storage_path = (
+                Path(settings.PRIVATE_STORAGE_PATH).resolve()
+                / storage_key
+            )
+            storage_path.unlink(missing_ok=True)
+
         raise HTTPException(
             status_code=(
                 status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
@@ -177,6 +200,9 @@ async def upload_evidence(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Evidence upload failed.",
         ) from exc
+
+    finally:
+        await file.close()
 
 
 # --------------------------------------------------

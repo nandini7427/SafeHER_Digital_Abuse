@@ -65,7 +65,7 @@ def private_storage(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------
-# Helper: Register and login
+# Helpers
 # --------------------------------------------------
 
 def register_and_login(client, email):
@@ -98,9 +98,23 @@ def register_and_login(client, email):
     )
 
 
-# --------------------------------------------------
-# Helper: Create a test case
-# --------------------------------------------------
+def auth_headers(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def grant_evidence_consent(client, token):
+    response = client.post(
+        "/api/v1/consent/",
+        json={
+            "consent_version": "1.0",
+            "purpose": "Evidence analysis",
+        },
+        headers=auth_headers(token),
+    )
+
+    assert response.status_code == 201
+    return response
+
 
 def create_case(test_db, owner_id):
     case = Case(
@@ -130,12 +144,14 @@ def test_evidence_upload_success(
         "evidence@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
     file_content = b"SafeHER evidence test content"
 
     response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "proof.txt",
@@ -171,7 +187,95 @@ def test_evidence_upload_success(
 
 
 # --------------------------------------------------
-# 2. Upload requires authentication
+# 2. Upload without consent is rejected
+# --------------------------------------------------
+
+def test_evidence_upload_without_consent_is_rejected(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "no-consent@example.com",
+    )
+
+    case_id = create_case(test_db, user_id)
+
+    response = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "proof.txt",
+                b"Evidence without consent",
+                "text/plain",
+            ),
+        },
+    )
+
+    assert response.status_code == 403
+    assert "consent" in response.json()["detail"].lower()
+    assert len(list(private_storage.iterdir())) == 0
+
+    evidence_records = test_db.scalars(
+        select(Evidence)
+    ).all()
+
+    assert len(evidence_records) == 0
+
+
+# --------------------------------------------------
+# 3. Upload after consent withdrawal is rejected
+# --------------------------------------------------
+
+def test_evidence_upload_after_consent_withdrawal_is_rejected(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "withdraw-consent@example.com",
+    )
+
+    consent_response = grant_evidence_consent(client, token)
+    consent_id = consent_response.json()["id"]
+
+    withdrawal_response = client.post(
+        f"/api/v1/consent/{consent_id}/withdraw",
+        headers=auth_headers(token),
+    )
+
+    assert withdrawal_response.status_code == 200
+    assert withdrawal_response.json()["status"] == "withdrawn"
+
+    case_id = create_case(test_db, user_id)
+
+    response = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "proof.txt",
+                b"Evidence after withdrawal",
+                "text/plain",
+            ),
+        },
+    )
+
+    assert response.status_code == 403
+    assert len(list(private_storage.iterdir())) == 0
+
+    evidence_records = test_db.scalars(
+        select(Evidence)
+    ).all()
+
+    assert len(evidence_records) == 0
+
+
+# --------------------------------------------------
+# 4. Upload requires authentication
 # --------------------------------------------------
 
 def test_evidence_upload_requires_authentication(
@@ -200,7 +304,7 @@ def test_evidence_upload_requires_authentication(
 
 
 # --------------------------------------------------
-# 3. User cannot upload to another user's case
+# 5. User cannot upload to another user's case
 # --------------------------------------------------
 
 def test_user_cannot_upload_to_another_users_case(
@@ -223,9 +327,11 @@ def test_user_cannot_upload_to_another_users_case(
         user_two_id,
     )
 
+    grant_evidence_consent(client, user_one_token)
+
     response = client.post(
         f"/api/v1/evidence/cases/{user_two_case_id}",
-        headers={"Authorization": f"Bearer {user_one_token}"},
+        headers=auth_headers(user_one_token),
         files={
             "file": (
                 "proof.txt",
@@ -240,7 +346,7 @@ def test_user_cannot_upload_to_another_users_case(
 
 
 # --------------------------------------------------
-# 4. Unsupported file format is rejected
+# 6. Unsupported file format is rejected
 # --------------------------------------------------
 
 def test_unsupported_file_format_rejected(
@@ -253,11 +359,13 @@ def test_unsupported_file_format_rejected(
         "unsupported@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
 
     response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "malware.exe",
@@ -272,7 +380,7 @@ def test_unsupported_file_format_rejected(
 
 
 # --------------------------------------------------
-# 5. File content must match its extension
+# 7. File content must match its extension
 # --------------------------------------------------
 
 def test_file_content_must_match_extension(
@@ -285,11 +393,13 @@ def test_file_content_must_match_extension(
         "fake-file@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
 
     response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "fake.jpg",
@@ -304,7 +414,7 @@ def test_file_content_must_match_extension(
 
 
 # --------------------------------------------------
-# 6. User can list their own case evidence
+# 8. User can list their own case evidence
 # --------------------------------------------------
 
 def test_user_can_list_own_case_evidence(
@@ -317,12 +427,14 @@ def test_user_can_list_own_case_evidence(
         "list-evidence@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
     file_content = b"SafeHER listing test"
 
     upload_response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "proof.txt",
@@ -336,7 +448,7 @@ def test_user_can_list_own_case_evidence(
 
     response = client.get(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
     )
 
     assert response.status_code == 200
@@ -359,7 +471,7 @@ def test_user_can_list_own_case_evidence(
 
 
 # --------------------------------------------------
-# 7. User cannot list another user's case evidence
+# 9. User cannot list another user's case evidence
 # --------------------------------------------------
 
 def test_user_cannot_list_another_users_case_evidence(
@@ -383,7 +495,7 @@ def test_user_cannot_list_another_users_case_evidence(
 
     response = client.get(
         f"/api/v1/evidence/cases/{user_two_case_id}",
-        headers={"Authorization": f"Bearer {user_one_token}"},
+        headers=auth_headers(user_one_token),
     )
 
     assert response.status_code == 404
@@ -391,7 +503,7 @@ def test_user_cannot_list_another_users_case_evidence(
 
 
 # --------------------------------------------------
-# 8. Evidence listing requires authentication
+# 10. Evidence listing requires authentication
 # --------------------------------------------------
 
 def test_evidence_listing_requires_authentication(
@@ -413,7 +525,7 @@ def test_evidence_listing_requires_authentication(
 
 
 # --------------------------------------------------
-# 9. User can download their own evidence
+# 11. User can download their own evidence
 # --------------------------------------------------
 
 def test_user_can_download_own_evidence(
@@ -426,12 +538,14 @@ def test_user_can_download_own_evidence(
         "download-own@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
     file_content = b"Private SafeHER evidence"
 
     upload_response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "proof.txt",
@@ -446,7 +560,7 @@ def test_user_can_download_own_evidence(
 
     response = client.get(
         f"/api/v1/evidence/{evidence_id}/download",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
     )
 
     assert response.status_code == 200
@@ -456,7 +570,7 @@ def test_user_can_download_own_evidence(
 
 
 # --------------------------------------------------
-# 10. Evidence download requires authentication
+# 12. Evidence download requires authentication
 # --------------------------------------------------
 
 def test_evidence_download_requires_authentication(
@@ -468,11 +582,13 @@ def test_evidence_download_requires_authentication(
         "download-noauth@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
 
     upload_response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "proof.txt",
@@ -493,7 +609,7 @@ def test_evidence_download_requires_authentication(
 
 
 # --------------------------------------------------
-# 11. User cannot download another user's evidence
+# 13. User cannot download another user's evidence
 # --------------------------------------------------
 
 def test_user_cannot_download_another_users_evidence(
@@ -511,6 +627,8 @@ def test_user_cannot_download_another_users_evidence(
         "download-user-two@example.com",
     )
 
+    grant_evidence_consent(client, user_two_token)
+
     user_two_case_id = create_case(
         test_db,
         user_two_id,
@@ -518,7 +636,7 @@ def test_user_cannot_download_another_users_evidence(
 
     upload_response = client.post(
         f"/api/v1/evidence/cases/{user_two_case_id}",
-        headers={"Authorization": f"Bearer {user_two_token}"},
+        headers=auth_headers(user_two_token),
         files={
             "file": (
                 "private.txt",
@@ -533,7 +651,7 @@ def test_user_cannot_download_another_users_evidence(
 
     response = client.get(
         f"/api/v1/evidence/{evidence_id}/download",
-        headers={"Authorization": f"Bearer {user_one_token}"},
+        headers=auth_headers(user_one_token),
     )
 
     assert response.status_code == 404
@@ -541,7 +659,7 @@ def test_user_cannot_download_another_users_evidence(
 
 
 # --------------------------------------------------
-# 12. Missing evidence file returns 404
+# 14. Missing evidence file returns 404
 # --------------------------------------------------
 
 def test_download_missing_evidence_file_returns_404(
@@ -554,11 +672,13 @@ def test_download_missing_evidence_file_returns_404(
         "download-missing@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
 
     upload_response = client.post(
         f"/api/v1/evidence/cases/{case_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
         files={
             "file": (
                 "proof.txt",
@@ -571,13 +691,12 @@ def test_download_missing_evidence_file_returns_404(
     assert upload_response.status_code == 201
     evidence_id = upload_response.json()["id"]
 
-    # Simulate a missing file in private storage.
     for stored_file in private_storage.iterdir():
         stored_file.unlink()
 
     response = client.get(
         f"/api/v1/evidence/{evidence_id}/download",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=auth_headers(token),
     )
 
     assert response.status_code == 404
@@ -585,7 +704,7 @@ def test_download_missing_evidence_file_returns_404(
 
 
 # --------------------------------------------------
-# 13. Same user cannot upload identical evidence twice
+# 15. Same user cannot upload identical evidence twice
 # --------------------------------------------------
 
 def test_duplicate_evidence_upload_is_rejected(
@@ -598,9 +717,11 @@ def test_duplicate_evidence_upload_is_rejected(
         "duplicate-test@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
     file_content = b"SafeHER duplicate evidence test"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = auth_headers(token)
 
     first_upload = client.post(
         f"/api/v1/evidence/cases/{case_id}",
@@ -631,7 +752,6 @@ def test_duplicate_evidence_upload_is_rejected(
     assert second_upload.status_code == 409
     assert "Duplicate evidence detected" in second_upload.json()["detail"]
 
-    # Only the original file should remain.
     assert len(list(private_storage.iterdir())) == 1
 
     evidence_records = test_db.scalars(
@@ -653,7 +773,7 @@ def test_duplicate_evidence_upload_is_rejected(
 
 
 # --------------------------------------------------
-# 14. Duplicate detection works across different filenames
+# 16. Duplicate detection works across different filenames
 # --------------------------------------------------
 
 def test_duplicate_evidence_with_different_filename_is_rejected(
@@ -666,9 +786,11 @@ def test_duplicate_evidence_with_different_filename_is_rejected(
         "duplicate-filename@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     case_id = create_case(test_db, user_id)
     file_content = b"Identical content with different filenames"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = auth_headers(token)
 
     first_upload = client.post(
         f"/api/v1/evidence/cases/{case_id}",
@@ -701,7 +823,7 @@ def test_duplicate_evidence_with_different_filename_is_rejected(
 
 
 # --------------------------------------------------
-# 15. Duplicate detection works across different cases
+# 17. Duplicate detection works across different cases
 # --------------------------------------------------
 
 def test_duplicate_evidence_across_different_cases_is_rejected(
@@ -714,11 +836,13 @@ def test_duplicate_evidence_across_different_cases_is_rejected(
         "duplicate-cases@example.com",
     )
 
+    grant_evidence_consent(client, token)
+
     first_case_id = create_case(test_db, user_id)
     second_case_id = create_case(test_db, user_id)
 
     file_content = b"Same evidence uploaded to two cases"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = auth_headers(token)
 
     first_upload = client.post(
         f"/api/v1/evidence/cases/{first_case_id}",
@@ -751,7 +875,7 @@ def test_duplicate_evidence_across_different_cases_is_rejected(
 
 
 # --------------------------------------------------
-# 16. Different users can upload identical evidence
+# 18. Different users can upload identical evidence
 # --------------------------------------------------
 
 def test_different_users_can_upload_identical_evidence(
@@ -769,6 +893,9 @@ def test_different_users_can_upload_identical_evidence(
         "duplicate-user-two@example.com",
     )
 
+    grant_evidence_consent(client, user_one_token)
+    grant_evidence_consent(client, user_two_token)
+
     user_one_case = create_case(test_db, user_one_id)
     user_two_case = create_case(test_db, user_two_id)
 
@@ -776,7 +903,7 @@ def test_different_users_can_upload_identical_evidence(
 
     first_upload = client.post(
         f"/api/v1/evidence/cases/{user_one_case}",
-        headers={"Authorization": f"Bearer {user_one_token}"},
+        headers=auth_headers(user_one_token),
         files={
             "file": (
                 "proof.txt",
@@ -790,7 +917,7 @@ def test_different_users_can_upload_identical_evidence(
 
     second_upload = client.post(
         f"/api/v1/evidence/cases/{user_two_case}",
-        headers={"Authorization": f"Bearer {user_two_token}"},
+        headers=auth_headers(user_two_token),
         files={
             "file": (
                 "proof.txt",
@@ -802,7 +929,6 @@ def test_different_users_can_upload_identical_evidence(
 
     assert second_upload.status_code == 201
 
-    # Each user should have their own stored copy.
     assert len(list(private_storage.iterdir())) == 2
 
     evidence_records = test_db.scalars(

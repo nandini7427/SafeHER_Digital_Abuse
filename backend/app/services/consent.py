@@ -1,4 +1,3 @@
-
 from uuid import UUID
 
 from sqlalchemy import select
@@ -104,3 +103,19 @@ def get_user_consent(
     )
 
     return db.scalar(statement)
+
+
+def has_active_consent(
+    db: Session,
+    user_id: UUID,
+    purpose: str,
+) -> bool:
+    """Check whether the user has active consent for a specific purpose."""
+
+    statement = select(Consent.id).where(
+        Consent.user_id == user_id,
+        Consent.purpose == purpose,
+        Consent.status == "granted",
+    )
+
+    return db.scalar(statement) is not None
