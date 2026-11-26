@@ -6,6 +6,7 @@ from backend.app.api.auth import router as auth_router
 from backend.app.api.admin import router as admin_router
 from backend.app.api.evidence import router as evidence_router
 from backend.app.api.cases import router as cases_router
+from backend.app.api.consent import router as consent_router
 
 
 app = FastAPI(
@@ -36,6 +37,12 @@ app.include_router(
 # Case management routes
 app.include_router(
     cases_router,
+    prefix=settings.API_V1_PREFIX
+)
+
+# Consent management routes
+app.include_router(
+    consent_router,
     prefix=settings.API_V1_PREFIX
 )
 
