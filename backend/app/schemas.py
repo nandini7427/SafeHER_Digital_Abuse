@@ -105,3 +105,33 @@ class CaseResponse(BaseModel):
     description: str | None
     status: str
     created_at: datetime
+
+# --------------------------------------------------
+# Consent Management Schemas
+# --------------------------------------------------
+
+class ConsentCreate(BaseModel):
+    consent_version: str = Field(min_length=1, max_length=50)
+    purpose: str = Field(min_length=3, max_length=255)
+
+    @field_validator("consent_version", "purpose")
+    @classmethod
+    def validate_consent_fields(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("This field cannot be empty.")
+
+        return value
+
+
+class ConsentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    consent_version: str
+    purpose: str
+    status: str
+    granted_at: datetime
+    withdrawn_at: datetime | None
