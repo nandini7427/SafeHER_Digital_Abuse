@@ -14,12 +14,17 @@ from backend.app.database import get_db
 from backend.app.models import AuditLog, Case, Evidence, User
 from backend.app.security.dependencies import get_current_user
 from backend.app.services.consent import has_active_consent
-from backend.app.services.evidence import save_evidence_file
+from backend.app.services.evidence import (
+    calculate_hash_distance,
+    generate_perceptual_hash,
+    save_evidence_file,
+)
 
 
 router = APIRouter(prefix="/evidence", tags=["Evidence"])
 
 REQUIRED_EVIDENCE_CONSENT = "Evidence analysis"
+PERCEPTUAL_HASH_DISTANCE_THRESHOLD = 8
 
 
 # --------------------------------------------------
@@ -86,10 +91,15 @@ async def upload_evidence(
         )
 
     storage_key = None
+    upload_committed = False
 
     try:
         storage_key, file_size, file_hash = await save_evidence_file(file)
 
+        storage_dir = Path(settings.PRIVATE_STORAGE_PATH).resolve()
+        storage_path = (storage_dir / storage_key).resolve()
+
+        # Preserve exact SHA-256 duplicate detection.
         duplicate = db.scalar(
             select(Evidence.id).where(
                 Evidence.owner_id == current_user.id,
@@ -98,13 +108,6 @@ async def upload_evidence(
         )
 
         if duplicate is not None:
-            storage_path = (
-                Path(settings.PRIVATE_STORAGE_PATH).resolve()
-                / storage_key
-            )
-            storage_path.unlink(missing_ok=True)
-            storage_key = None
-
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -112,6 +115,42 @@ async def upload_evidence(
                     "This file has already been uploaded."
                 ),
             )
+
+        # Generate pHash for supported image files.
+        extension = Path(original_filename).suffix.lower()
+
+        perceptual_hash = generate_perceptual_hash(
+            storage_path,
+            extension,
+        )
+
+        # Compare only with this user's existing image evidence.
+        similar_evidence = []
+
+        if perceptual_hash is not None:
+            existing_evidence = db.scalars(
+                select(Evidence).where(
+                    Evidence.owner_id == current_user.id,
+                    Evidence.perceptual_hash.is_not(None),
+                )
+            ).all()
+
+            for existing in existing_evidence:
+                distance = calculate_hash_distance(
+                    perceptual_hash,
+                    existing.perceptual_hash,
+                )
+
+                if distance <= PERCEPTUAL_HASH_DISTANCE_THRESHOLD:
+                    similar_evidence.append(
+                        {
+                            "evidence_id": str(existing.id),
+                            "original_filename": existing.original_filename,
+                            "hamming_distance": distance,
+                        }
+                    )
+
+        similarity_warning = len(similar_evidence) > 0
 
         evidence = Evidence(
             case_id=case.id,
@@ -121,6 +160,7 @@ async def upload_evidence(
             mime_type=mime_type,
             size_bytes=file_size,
             sha256=file_hash,
+            perceptual_hash=perceptual_hash,
         )
 
         db.add(evidence)
@@ -135,6 +175,10 @@ async def upload_evidence(
 
         db.add(audit_entry)
         db.commit()
+
+        # Mark successful upload so its stored file is preserved.
+        upload_committed = True
+
         db.refresh(evidence)
 
         return {
@@ -145,30 +189,18 @@ async def upload_evidence(
             "mime_type": evidence.mime_type,
             "size_bytes": evidence.size_bytes,
             "sha256": evidence.sha256,
+            "perceptual_hash": evidence.perceptual_hash,
+            "similarity_warning": similarity_warning,
+            "similar_evidence": similar_evidence,
             "uploaded_at": evidence.uploaded_at,
         }
 
     except HTTPException:
         db.rollback()
-
-        if storage_key:
-            storage_path = (
-                Path(settings.PRIVATE_STORAGE_PATH).resolve()
-                / storage_key
-            )
-            storage_path.unlink(missing_ok=True)
-
         raise
 
     except ValueError as exc:
         db.rollback()
-
-        if storage_key:
-            storage_path = (
-                Path(settings.PRIVATE_STORAGE_PATH).resolve()
-                / storage_key
-            )
-            storage_path.unlink(missing_ok=True)
 
         raise HTTPException(
             status_code=(
@@ -182,19 +214,20 @@ async def upload_evidence(
     except Exception as exc:
         db.rollback()
 
-        if storage_key:
-            storage_path = (
-                Path(settings.PRIVATE_STORAGE_PATH).resolve()
-                / storage_key
-            )
-            storage_path.unlink(missing_ok=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Evidence upload failed.",
         ) from exc
 
     finally:
+        # Delete the stored file only if the upload was not committed.
+        if storage_key and not upload_committed:
+            storage_path = (
+                Path(settings.PRIVATE_STORAGE_PATH).resolve()
+                / storage_key
+            )
+            storage_path.unlink(missing_ok=True)
+
         await file.close()
 
 
@@ -240,6 +273,7 @@ def list_case_evidence(
                 "mime_type": item.mime_type,
                 "size_bytes": item.size_bytes,
                 "sha256": item.sha256,
+                "perceptual_hash": item.perceptual_hash,
                 "uploaded_at": item.uploaded_at,
             }
             for item in evidence_records

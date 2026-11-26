@@ -84,7 +84,12 @@ class Evidence(Base):
     )
     mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-    sha256: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    sha256: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=False
+    )
+    perceptual_hash: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=current_time, nullable=False
     )

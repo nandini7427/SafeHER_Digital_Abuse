@@ -1,8 +1,10 @@
 
 import hashlib
+from io import BytesIO
 from uuid import UUID
 
 import pytest
+from PIL import Image, ImageDraw
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -128,6 +130,26 @@ def create_case(test_db, owner_id):
     test_db.refresh(case)
 
     return str(case.id)
+
+
+def create_test_image(color="blue", size=(256, 256)):
+    """Create a valid PNG image in memory for testing."""
+    image = Image.new("RGB", size, color=color)
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle(
+        (40, 40, 150, 150),
+        fill="yellow",
+    )
+
+    draw.ellipse(
+        (100, 100, 220, 220),
+        fill="red",
+    )
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 # --------------------------------------------------
@@ -980,11 +1002,9 @@ def test_modified_evidence_file_download_is_blocked(
 
     assert evidence is not None
 
-    # Simulate unauthorized modification of the stored evidence.
     stored_file = private_storage / evidence.storage_key
     stored_file.write_bytes(b"Modified evidence content")
 
-    # The backend must detect the hash mismatch and block download.
     response = client.get(
         f"/api/v1/evidence/{evidence_id}/download",
         headers=auth_headers(token),
@@ -994,3 +1014,293 @@ def test_modified_evidence_file_download_is_blocked(
     assert "integrity verification failed" in (
         response.json()["detail"].lower()
     )
+
+
+# --------------------------------------------------
+# 20. Image upload generates a perceptual hash
+# --------------------------------------------------
+
+def test_image_upload_generates_perceptual_hash(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "phash-generate@example.com",
+    )
+
+    grant_evidence_consent(client, token)
+    case_id = create_case(test_db, user_id)
+
+    image_content = create_test_image()
+
+    response = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "image.png",
+                image_content,
+                "image/png",
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+
+    result = response.json()
+
+    assert result["perceptual_hash"] is not None
+    assert len(result["perceptual_hash"]) == 16
+    assert result["similarity_warning"] is False
+    assert result["similar_evidence"] == []
+
+    evidence = test_db.scalar(
+        select(Evidence).where(
+            Evidence.id == UUID(result["id"])
+        )
+    )
+
+    assert evidence.perceptual_hash == result["perceptual_hash"]
+    assert len(list(private_storage.iterdir())) == 1
+
+
+# --------------------------------------------------
+# 21. Resized copy produces a similarity warning
+# --------------------------------------------------
+
+def test_similar_resized_image_produces_warning(
+    client,
+    test_db,
+    private_storage,
+):
+    user_id, token = register_and_login(
+        client,
+        "phash-similar@example.com",
+    )
+
+    grant_evidence_consent(client, token)
+    case_id = create_case(test_db, user_id)
+
+    original_image = create_test_image(size=(256, 256))
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "original.png",
+                original_image,
+                "image/png",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+    assert first_upload.json()["similarity_warning"] is False
+
+    resized = Image.open(BytesIO(original_image))
+    resized = resized.resize((128, 128))
+
+    resized_buffer = BytesIO()
+    resized.save(resized_buffer, format="PNG")
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "resized.png",
+                resized_buffer.getvalue(),
+                "image/png",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 201
+
+    result = second_upload.json()
+
+    assert result["similarity_warning"] is True
+    assert len(result["similar_evidence"]) >= 1
+
+    match = result["similar_evidence"][0]
+
+    assert match["original_filename"] == "original.png"
+    assert match["hamming_distance"] <= 8
+
+
+# --------------------------------------------------
+# 22. Unrelated image does not produce a similarity warning
+# --------------------------------------------------
+
+def test_unrelated_image_does_not_produce_similarity_warning(
+    client,
+    test_db,
+):
+    user_id, token = register_and_login(
+        client,
+        "phash-unrelated@example.com",
+    )
+
+    grant_evidence_consent(client, token)
+    case_id = create_case(test_db, user_id)
+
+    first_image = create_test_image(color="blue")
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "first.png",
+                first_image,
+                "image/png",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    # Create a visually different image.
+    unrelated = Image.new(
+        "RGB",
+        (256, 256),
+        color="black",
+    )
+
+    draw = ImageDraw.Draw(unrelated)
+    draw.line(
+        (0, 0, 256, 256),
+        fill="white",
+        width=15,
+    )
+    draw.line(
+        (256, 0, 0, 256),
+        fill="white",
+        width=15,
+    )
+
+    buffer = BytesIO()
+    unrelated.save(buffer, format="PNG")
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "unrelated.png",
+                buffer.getvalue(),
+                "image/png",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 201
+    assert second_upload.json()["similarity_warning"] is False
+    assert second_upload.json()["similar_evidence"] == []
+
+
+# --------------------------------------------------
+# 23. Similarity detection is isolated between users
+# --------------------------------------------------
+
+def test_perceptual_similarity_is_isolated_between_users(
+    client,
+    test_db,
+):
+    user_one_id, user_one_token = register_and_login(
+        client,
+        "phash-user-one@example.com",
+    )
+
+    user_two_id, user_two_token = register_and_login(
+        client,
+        "phash-user-two@example.com",
+    )
+
+    grant_evidence_consent(client, user_one_token)
+    grant_evidence_consent(client, user_two_token)
+
+    user_one_case = create_case(test_db, user_one_id)
+    user_two_case = create_case(test_db, user_two_id)
+
+    image_content = create_test_image()
+
+    first_upload = client.post(
+        f"/api/v1/evidence/cases/{user_one_case}",
+        headers=auth_headers(user_one_token),
+        files={
+            "file": (
+                "user-one.png",
+                image_content,
+                "image/png",
+            ),
+        },
+    )
+
+    assert first_upload.status_code == 201
+
+    second_upload = client.post(
+        f"/api/v1/evidence/cases/{user_two_case}",
+        headers=auth_headers(user_two_token),
+        files={
+            "file": (
+                "user-two.png",
+                image_content,
+                "image/png",
+            ),
+        },
+    )
+
+    assert second_upload.status_code == 201
+
+    # User two must not receive a match belonging to user one.
+    assert second_upload.json()["similarity_warning"] is False
+    assert second_upload.json()["similar_evidence"] == []
+
+
+# --------------------------------------------------
+# 24. Non-image evidence does not receive a perceptual hash
+# --------------------------------------------------
+
+def test_non_image_evidence_has_no_perceptual_hash(
+    client,
+    test_db,
+):
+    user_id, token = register_and_login(
+        client,
+        "phash-text@example.com",
+    )
+
+    grant_evidence_consent(client, token)
+    case_id = create_case(test_db, user_id)
+
+    response = client.post(
+        f"/api/v1/evidence/cases/{case_id}",
+        headers=auth_headers(token),
+        files={
+            "file": (
+                "proof.txt",
+                b"SafeHER text evidence",
+                "text/plain",
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+
+    result = response.json()
+
+    assert result["perceptual_hash"] is None
+    assert result["similarity_warning"] is False
+    assert result["similar_evidence"] == []
+
+    evidence = test_db.scalar(
+        select(Evidence).where(
+            Evidence.id == UUID(result["id"])
+        )
+    )
+
+    assert evidence.perceptual_hash is None

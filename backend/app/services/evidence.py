@@ -1,7 +1,11 @@
 
 import hashlib
 import uuid
+import warnings
 from pathlib import Path
+
+import imagehash
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from fastapi import UploadFile
 
@@ -9,6 +13,9 @@ from backend.app.config import settings
 
 
 CHUNK_SIZE = 1024 * 1024  # 1 MB
+MAX_IMAGE_PIXELS = 25_000_000
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 ALLOWED_EXTENSIONS = {
     ".jpg",
@@ -55,6 +62,83 @@ def validate_file_signature(header: bytes, extension: str) -> bool:
             return False
 
     return False
+
+
+def generate_perceptual_hash(
+    file_path: Path,
+    extension: str,
+) -> str | None:
+    """
+    Generate a perceptual hash for supported image evidence.
+
+    Returns:
+        A 16-character hexadecimal pHash for images,
+        or None for non-image files.
+    """
+
+    if extension.lower() not in IMAGE_EXTENSIONS:
+        return None
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "error",
+                Image.DecompressionBombWarning,
+            )
+
+            with Image.open(file_path) as image:
+                width, height = image.size
+
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width * height > MAX_IMAGE_PIXELS
+                ):
+                    raise ValueError(
+                        "Image dimensions exceed the allowed limit."
+                    )
+
+                image.verify()
+
+            with Image.open(file_path) as image:
+                image.load()
+                image = ImageOps.exif_transpose(image)
+                image = image.convert("RGB")
+
+                return str(imagehash.phash(image))
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
+        raise ValueError(
+            "Unable to process image for perceptual hashing."
+        ) from exc
+
+
+def calculate_hash_distance(
+    first_hash: str,
+    second_hash: str,
+) -> int:
+    """Calculate Hamming distance between two 64-bit pHashes."""
+
+    if (
+        len(first_hash) != 16
+        or len(second_hash) != 16
+    ):
+        raise ValueError("Invalid perceptual hash format.")
+
+    try:
+        first_value = int(first_hash, 16)
+        second_value = int(second_hash, 16)
+    except ValueError as exc:
+        raise ValueError(
+            "Invalid perceptual hash format."
+        ) from exc
+
+    return (first_value ^ second_value).bit_count()
 
 
 async def save_evidence_file(
